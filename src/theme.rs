@@ -791,21 +791,31 @@ pub fn tab_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool, width: f
         p.rect_stroke(rect, r(R_SM), Stroke::new(2.0_f32, BORDER_FOCUS), StrokeKind::Outside);
     }
 
-    // Ícone + rótulo agrupados e centrados.
+    // Ícone + rótulo centrados como bloco. Em aba estreita (janela a 360px) o
+    // bloco não cabe → degrada para SÓ TEXTO em vez de cortar (mesma lógica de
+    // action_button / call_control_button). Medição real, não heurística.
     let icon_sz = 14.0;
     let gap = 7.0;
-    let label_w = label.chars().count() as f32 * FS_LABEL * 0.54;
-    let block_w = icon_sz + gap + label_w;
+    let font_id = font_bold(FS_LABEL);
+    let label_w = text_width(ui, label, font_id.clone());
+    let fits_icon = (icon_sz + gap + label_w) <= (width - 8.0);
     let c = rect.center();
-    let icon_c = c - Vec2::new(block_w / 2.0 - icon_sz / 2.0, 0.0);
-    paint_icon(p, icon, icon_c, icon_sz, fg);
-    p.text(
-        Pos2::new(icon_c.x + icon_sz / 2.0 + gap, c.y),
-        Align2::LEFT_CENTER,
-        label,
-        font_bold(FS_LABEL),
-        fg,
-    );
+
+    let p = ui.painter();
+    if fits_icon {
+        let block_w = icon_sz + gap + label_w;
+        let icon_c = c - Vec2::new(block_w / 2.0 - icon_sz / 2.0, 0.0);
+        paint_icon(p, icon, icon_c, icon_sz, fg);
+        p.text(
+            Pos2::new(icon_c.x + icon_sz / 2.0 + gap, c.y),
+            Align2::LEFT_CENTER,
+            label,
+            font_id,
+            fg,
+        );
+    } else {
+        p.text(c, Align2::CENTER_CENTER, label, font_id, fg);
+    }
 
     resp
 }

@@ -380,7 +380,11 @@ impl RustSipApp {
         ];
 
         let available_w = ui.available_width();
-        let tab_w = available_w / tabs.len() as f32;
+        // Desconta os (n-1) gaps de item_spacing.x que o ui.horizontal insere ENTRE
+        // as abas — senão a soma (5 abas + 4 gaps) estoura e a 5ª ("Logs SIP") corta.
+        let n = tabs.len() as f32;
+        let gaps = ui.spacing().item_spacing.x * (n - 1.0);
+        let tab_w = ((available_w - gaps) / n).max(0.0);
 
         ui.horizontal(|ui| {
             for (tab, label, icon) in tabs {
