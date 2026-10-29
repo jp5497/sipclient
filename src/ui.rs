@@ -2,9 +2,10 @@ use crate::audio::{AudioDeviceInfo, AudioEngine, MODE_LOOPBACK_TEST};
 use crate::config::{AppConfig, CallDirection, CallHistoryEntry, Contact, TransportProtocol};
 use crate::sip::{CallPhase, RegistrationStatus, SipCommand, SipController};
 use crate::theme::{
-    self, action_button, card_frame, dial_key, font, font_bold, font_mono,
+    self, action_button, call_control_button, card_frame, dial_key, font, font_bold, font_mono,
     icon_tool_button, paint_icon, status_chip, tab_button, text_input, vu_meter, Icon,
     ACCENT_BLUE, BG_ACTIVE, BG_APP, BG_CARD, BG_INPUT, BG_PANEL, BORDER_FOCUS, BORDER_SUBTLE,
+    FS_BODY, FS_CAPTION, FS_HEADING, FS_LABEL, FS_MICRO, FS_SUBHEAD, FS_TITLE, SP1, SP2, SP5,
     STATUS_AMBER, STATUS_GREEN, STATUS_RED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use chrono::Local;
@@ -277,7 +278,7 @@ impl eframe::App for RustSipApp {
                                 ui.horizontal(|ui| {
                                     paint_icon(ui.painter(), Icon::Check, ui.cursor().min + Vec2::new(6.0, 7.0), 12.0, STATUS_GREEN);
                                     ui.add_space(14.0);
-                                    ui.label(RichText::new(msg).font(font_bold(12.5)).color(TEXT_PRIMARY));
+                                    ui.label(RichText::new(msg).font(font_bold(FS_LABEL)).color(TEXT_PRIMARY));
                                 });
                             });
                         ui.add_space(6.0);
@@ -318,7 +319,7 @@ impl RustSipApp {
 
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RustSIP").font(font_bold(14.5)).color(TEXT_PRIMARY));
+                    ui.label(RichText::new("RustSIP").font(font_bold(FS_SUBHEAD)).color(TEXT_PRIMARY));
                     status_chip(ui, self.config.account.transport.as_str(), ACCENT_BLUE);
                 });
 
@@ -328,7 +329,7 @@ impl RustSipApp {
                     "Configure sua conta SIP na aba Configurações".to_string()
                 };
 
-                ui.label(RichText::new(subtitle).font(font(11.0)).color(TEXT_SECONDARY));
+                ui.label(RichText::new(subtitle).font(font(FS_CAPTION)).color(TEXT_SECONDARY));
             });
 
             // Botão de Conectar / Desconectar
@@ -336,12 +337,12 @@ impl RustSipApp {
                 if is_online || matches!(reg_status, RegistrationStatus::Connecting) {
                     let btn = egui::Button::new(
                         RichText::new("Desconectar")
-                            .font(font_bold(11.5))
+                            .font(font_bold(FS_CAPTION))
                             .color(STATUS_RED),
                     )
                     .fill(BG_CARD)
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .corner_radius(CornerRadius::same(5));
+                    .corner_radius(CornerRadius::same(theme::R_SM));
 
                     if ui.add(btn).clicked() {
                         self.sip.send(SipCommand::Disconnect);
@@ -349,11 +350,11 @@ impl RustSipApp {
                 } else if self.config.account.is_configured() {
                     let btn = egui::Button::new(
                         RichText::new("Conectar")
-                            .font(font_bold(11.5))
+                            .font(font_bold(FS_CAPTION))
                             .color(TEXT_PRIMARY),
                     )
                     .fill(ACCENT_BLUE)
-                    .corner_radius(CornerRadius::same(5));
+                    .corner_radius(CornerRadius::same(theme::R_SM));
 
                     if ui.add(btn).clicked() {
                         self.sip.send(SipCommand::Connect {
@@ -397,17 +398,17 @@ impl RustSipApp {
         let rx_pkts = self.sip.state.rtp_stats.rx_packets.load(Ordering::Relaxed);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Mic").font(font(11.0)).color(TEXT_MUTED));
+            ui.label(RichText::new("Mic").font(font(FS_CAPTION)).color(TEXT_MUTED));
             vu_meter(ui, mic_lvl, 65.0, STATUS_GREEN);
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("Fone").font(font(11.0)).color(TEXT_MUTED));
+            ui.add_space(SP2);
+            ui.label(RichText::new("Fone").font(font(FS_CAPTION)).color(TEXT_MUTED));
             vu_meter(ui, spk_lvl, 65.0, ACCENT_BLUE);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("RTP: {} TX • {} RX", tx_pkts, rx_pkts))
-                        .font(font_mono(10.5))
+                        .font(font_mono(FS_MICRO))
                         .color(TEXT_MUTED),
                 );
             });
@@ -425,8 +426,8 @@ impl RustSipApp {
 
         egui::Frame::NONE
             .fill(BG_CARD)
-            .stroke(Stroke::new(1.0_f32, border_color))
-            .corner_radius(CornerRadius::same(6))
+            .stroke(Stroke::new(1.5_f32, border_color))
+            .corner_radius(CornerRadius::same(theme::R_MD))
             .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| match call_phase {
                 CallPhase::Incoming {
@@ -437,9 +438,9 @@ impl RustSipApp {
                         ui.vertical(|ui| {
                             status_chip(ui, "CHAMADA RECEBIDA", STATUS_GREEN);
                             ui.add_space(2.0);
-                            ui.label(RichText::new(remote_name).font(font_bold(16.0)).color(TEXT_PRIMARY));
+                            ui.label(RichText::new(remote_name).font(font_bold(FS_HEADING)).color(TEXT_PRIMARY));
                             if remote_name != remote_number {
-                                ui.label(RichText::new(remote_number).font(font(12.0)).color(TEXT_SECONDARY));
+                                ui.label(RichText::new(remote_number).font(font(FS_LABEL)).color(TEXT_SECONDARY));
                             }
                         });
 
@@ -464,7 +465,7 @@ impl RustSipApp {
                         ui.vertical(|ui| {
                             status_chip(ui, status_text, ACCENT_BLUE);
                             ui.add_space(2.0);
-                            ui.label(RichText::new(remote_number).font(font_bold(16.0)).color(TEXT_PRIMARY));
+                            ui.label(RichText::new(remote_number).font(font_bold(FS_HEADING)).color(TEXT_PRIMARY));
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -491,9 +492,9 @@ impl RustSipApp {
                                 status_chip(ui, codec_name, ACCENT_BLUE);
                             });
                             ui.add_space(2.0);
-                            ui.label(RichText::new(remote_name).font(font_bold(16.0)).color(TEXT_PRIMARY));
+                            ui.label(RichText::new(remote_name).font(font_bold(FS_HEADING)).color(TEXT_PRIMARY));
                             if remote_name != remote_number {
-                                ui.label(RichText::new(remote_number).font(font(12.0)).color(TEXT_SECONDARY));
+                                ui.label(RichText::new(remote_number).font(font(FS_LABEL)).color(TEXT_SECONDARY));
                             }
                         });
 
@@ -504,48 +505,34 @@ impl RustSipApp {
                         });
                     });
 
-                    ui.add_space(8.0);
+                    ui.add_space(SP2);
                     ui.separator();
-                    ui.add_space(4.0);
+                    ui.add_space(SP1);
 
-                    // Controles de áudio em chamada (Mute e Hold)
+                    // Controles de áudio em chamada (Mudo e Espera) — ícones VETORIAIS.
                     let is_muted = self.audio.state.muted.load(Ordering::Relaxed);
                     let is_hold = self.audio.state.on_hold.load(Ordering::Relaxed);
 
                     ui.horizontal(|ui| {
-                        let mute_label = if is_muted { "Mudo Ativo" } else { "Silenciar Microfone" };
-                        let mute_color = if is_muted { STATUS_AMBER } else { TEXT_SECONDARY };
+                        let btn_w = (ui.available_width() - SP2) / 2.0;
 
-                        let btn_w = (ui.available_width() - 8.0) / 2.0;
-
-                        let mute_btn = egui::Button::new(
-                            RichText::new(format!("🎙 {}", mute_label))
-                                .font(font_bold(12.0))
-                                .color(mute_color),
-                        )
-                        .fill(if is_muted { BG_ACTIVE } else { BG_CARD })
-                        .stroke(Stroke::new(1.0_f32, if is_muted { STATUS_AMBER } else { BORDER_SUBTLE }))
-                        .corner_radius(CornerRadius::same(5))
-                        .min_size(Vec2::new(btn_w, 28.0));
-
-                        if ui.add(mute_btn).clicked() {
+                        // Mudo: Mic quando aberto, MicOff quando silenciado.
+                        let mute_icon = if is_muted { Icon::MicOff } else { Icon::Mic };
+                        let mute_label = if is_muted { "Mudo ativo" } else { "Silenciar" };
+                        if call_control_button(ui, mute_icon, mute_label, is_muted, STATUS_AMBER, btn_w, 30.0)
+                            .clicked()
+                        {
                             self.audio.state.muted.store(!is_muted, Ordering::Relaxed);
                         }
 
-                        let hold_label = if is_hold { "Retomar Chamada" } else { "Colocar em Espera" };
-                        let hold_color = if is_hold { ACCENT_BLUE } else { TEXT_SECONDARY };
+                        ui.add_space(SP2);
 
-                        let hold_btn = egui::Button::new(
-                            RichText::new(format!("⏸ {}", hold_label))
-                                .font(font_bold(12.0))
-                                .color(hold_color),
-                        )
-                        .fill(if is_hold { BG_ACTIVE } else { BG_CARD })
-                        .stroke(Stroke::new(1.0_f32, if is_hold { ACCENT_BLUE } else { BORDER_SUBTLE }))
-                        .corner_radius(CornerRadius::same(5))
-                        .min_size(Vec2::new(btn_w, 28.0));
-
-                        if ui.add(hold_btn).clicked() {
+                        // Espera: Pause quando ativo, Play (retomar) quando em espera.
+                        let hold_icon = if is_hold { Icon::Play } else { Icon::Pause };
+                        let hold_label = if is_hold { "Retomar" } else { "Em espera" };
+                        if call_control_button(ui, hold_icon, hold_label, is_hold, ACCENT_BLUE, btn_w, 30.0)
+                            .clicked()
+                        {
                             self.audio.state.on_hold.store(!is_hold, Ordering::Relaxed);
                         }
                     });
@@ -569,7 +556,7 @@ impl RustSipApp {
                     let resp = ui.add_sized(
                         Vec2::new(ui.available_width() - 65.0, 32.0),
                         egui::TextEdit::singleline(&mut self.dial_input)
-                            .font(font_bold(20.0))
+                            .font(font_bold(FS_TITLE))
                             .text_color(TEXT_PRIMARY)
                             .frame(false)
                             .hint_text(RichText::new("Digite o número ou ramal...").color(TEXT_MUTED)),
@@ -620,7 +607,7 @@ impl RustSipApp {
             ui.add_space(spacing);
         }
 
-        ui.add_space(4.0);
+        ui.add_space(SP1);
 
         // Botão de Discar
         if matches!(call_phase, CallPhase::Idle) {
@@ -656,7 +643,7 @@ impl RustSipApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.contact_search)
                                 .frame(false)
-                                .font(font(12.5))
+                                .font(font(FS_LABEL))
                                 .text_color(TEXT_PRIMARY)
                                 .hint_text(RichText::new("Buscar contato...").color(TEXT_MUTED))
                                 .desired_width(search_w - 30.0),
@@ -678,16 +665,16 @@ impl RustSipApp {
         });
 
         if self.show_add_contact {
-            ui.add_space(8.0);
+            ui.add_space(SP2);
             card_frame().show(ui, |ui| {
-                ui.label(RichText::new("Adicionar Contato").font(font_bold(13.0)).color(TEXT_PRIMARY));
+                ui.label(RichText::new("Adicionar Contato").font(font_bold(FS_BODY)).color(TEXT_PRIMARY));
                 ui.add_space(6.0);
                 text_input(ui, "Nome:", &mut self.new_contact_name, "Ex: Suporte Técnico", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "Número / Ramal:", &mut self.new_contact_number, "Ex: 2004 ou (31) 9...", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "Observação (opcional):", &mut self.new_contact_notes, "Ex: Ramal interno", false);
-                ui.add_space(8.0);
+                ui.add_space(SP2);
 
                 if action_button(ui, "Salvar Contato", Some(Icon::Check), STATUS_GREEN, ui.available_width(), 32.0).clicked()
                     && !self.new_contact_name.trim().is_empty()
@@ -709,7 +696,7 @@ impl RustSipApp {
             });
         }
 
-        ui.add_space(8.0);
+        ui.add_space(SP2);
 
         let query = self.contact_search.trim().to_lowercase();
         let filtered: Vec<(usize, &Contact)> = self
@@ -729,9 +716,9 @@ impl RustSipApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if filtered.is_empty() {
-                ui.add_space(20.0);
+                ui.add_space(SP5);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Nenhum contato encontrado").font(font(12.5)).color(TEXT_MUTED));
+                    ui.label(RichText::new("Nenhum contato encontrado").font(font(FS_LABEL)).color(TEXT_MUTED));
                 });
             }
 
@@ -741,10 +728,10 @@ impl RustSipApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&contact.name).font(font_bold(13.5)).color(TEXT_PRIMARY));
-                                ui.label(RichText::new(&contact.number).font(font(12.0)).color(ACCENT_BLUE));
+                                ui.label(RichText::new(&contact.name).font(font_bold(FS_BODY)).color(TEXT_PRIMARY));
+                                ui.label(RichText::new(&contact.number).font(font(FS_LABEL)).color(ACCENT_BLUE));
                                 if !contact.notes.is_empty() {
-                                    ui.label(RichText::new(&contact.notes).font(font(11.0)).color(TEXT_MUTED));
+                                    ui.label(RichText::new(&contact.notes).font(font(FS_CAPTION)).color(TEXT_MUTED));
                                 }
                             });
 
@@ -758,7 +745,7 @@ impl RustSipApp {
                             });
                         });
                     });
-                ui.add_space(4.0);
+                ui.add_space(SP1);
             }
         });
 
@@ -786,7 +773,7 @@ impl RustSipApp {
                 let is_sel = self.history_filter == f;
                 let btn = egui::Button::new(
                     RichText::new(lbl)
-                        .font(font_bold(11.5))
+                        .font(font_bold(FS_CAPTION))
                         .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
                 )
                 .fill(if is_sel { BG_ACTIVE } else { BG_CARD })
@@ -809,7 +796,7 @@ impl RustSipApp {
             });
         });
 
-        ui.add_space(8.0);
+        ui.add_space(SP2);
 
         let filtered: Vec<&CallHistoryEntry> = self
             .config
@@ -827,9 +814,9 @@ impl RustSipApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if filtered.is_empty() {
-                ui.add_space(20.0);
+                ui.add_space(SP5);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Nenhuma chamada no histórico").font(font(12.5)).color(TEXT_MUTED));
+                    ui.label(RichText::new("Nenhuma chamada no histórico").font(font(FS_LABEL)).color(TEXT_MUTED));
                 });
             }
 
@@ -851,16 +838,16 @@ impl RustSipApp {
 
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&entry.name).font(font_bold(13.0)).color(TEXT_PRIMARY));
+                                    ui.label(RichText::new(&entry.name).font(font_bold(FS_BODY)).color(TEXT_PRIMARY));
                                     status_chip(ui, dir_label, dir_color);
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&entry.number).font(font(11.5)).color(TEXT_SECONDARY));
-                                    ui.label(RichText::new("•").font(font(10.0)).color(TEXT_MUTED));
-                                    ui.label(RichText::new(&entry.timestamp).font(font(10.5)).color(TEXT_MUTED));
+                                    ui.label(RichText::new(&entry.number).font(font(FS_CAPTION)).color(TEXT_SECONDARY));
+                                    ui.label(RichText::new("•").font(font(FS_MICRO)).color(TEXT_MUTED));
+                                    ui.label(RichText::new(&entry.timestamp).font(font(FS_MICRO)).color(TEXT_MUTED));
                                     if entry.duration_secs > 0 {
-                                        ui.label(RichText::new("•").font(font(10.0)).color(TEXT_MUTED));
-                                        ui.label(RichText::new(format!("{:02}:{:02}", mins, secs)).font(font(10.5)).color(ACCENT_BLUE));
+                                        ui.label(RichText::new("•").font(font(FS_MICRO)).color(TEXT_MUTED));
+                                        ui.label(RichText::new(format!("{:02}:{:02}", mins, secs)).font(font(FS_MICRO)).color(ACCENT_BLUE));
                                     }
                                 });
                             });
@@ -872,7 +859,7 @@ impl RustSipApp {
                             });
                         });
                     });
-                ui.add_space(4.0);
+                ui.add_space(SP1);
             }
         });
 
@@ -887,21 +874,21 @@ impl RustSipApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Seção 1: Servidor SIP (FreeSWITCH)
             card_frame().show(ui, |ui| {
-                ui.label(RichText::new("Servidor SIP (FreeSWITCH)").font(font_bold(13.5)).color(TEXT_PRIMARY));
-                ui.add_space(8.0);
+                ui.label(RichText::new("Servidor SIP (FreeSWITCH)").font(font_bold(FS_BODY)).color(TEXT_PRIMARY));
+                ui.add_space(SP2);
 
                 text_input(ui, "Endereço do Servidor:", &mut self.config.account.server, "Ex: voipotimizar.otimizartecnologia.com.br", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "Domínio / Realm:", &mut self.config.account.domain, "Opcional (padrão = host do servidor)", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "Usuário / Ramal:", &mut self.config.account.username, "Ex: 2003", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "ID de Autenticação (Auth ID):", &mut self.config.account.auth_id, "Opcional (padrão = ramal)", false);
-                ui.add_space(4.0);
+                ui.add_space(SP1);
 
                 // Campo de Senha com alternador
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Senha SIP:").font(font_bold(11.5)).color(TEXT_SECONDARY));
+                    ui.label(RichText::new("Senha SIP:").font(font_bold(FS_CAPTION)).color(TEXT_SECONDARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let eye_icon = if self.show_password { Icon::EyeOff } else { Icon::Eye };
                         if icon_tool_button(ui, eye_icon, 20.0, "Mostrar senha", false, BORDER_SUBTLE).clicked() {
@@ -920,17 +907,17 @@ impl RustSipApp {
                             egui::TextEdit::singleline(&mut self.config.account.password)
                                 .frame(false)
                                 .password(!self.show_password)
-                                .font(font(13.5))
+                                .font(font(FS_BODY))
                                 .text_color(TEXT_PRIMARY)
                                 .desired_width(f32::INFINITY),
                         );
                     });
 
-                ui.add_space(4.0);
+                ui.add_space(SP1);
                 text_input(ui, "Nome de Exibição:", &mut self.config.account.display_name, "Ex: João Rocha", false);
 
-                ui.add_space(8.0);
-                ui.label(RichText::new("Protocolo de Transporte:").font(font_bold(11.5)).color(TEXT_SECONDARY));
+                ui.add_space(SP2);
+                ui.label(RichText::new("Protocolo de Transporte:").font(font_bold(FS_CAPTION)).color(TEXT_SECONDARY));
                 ui.horizontal(|ui| {
                     let udp_sel = self.config.account.transport == TransportProtocol::Udp;
                     if ui.selectable_label(udp_sel, "UDP (Padrão)").clicked() {
@@ -942,10 +929,10 @@ impl RustSipApp {
                     }
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(SP2);
                 ui.checkbox(&mut self.config.account.use_stun, "Descobrir IP público RTP via STUN");
                 if self.config.account.use_stun {
-                    ui.add_space(4.0);
+                    ui.add_space(SP1);
                     text_input(ui, "Servidor STUN:", &mut self.config.account.stun_server, "stun.l.google.com:19302", false);
                 }
 
@@ -968,7 +955,7 @@ impl RustSipApp {
             // Seção 2: Áudio PipeWire
             card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Dispositivos de Áudio (PipeWire Linux)").font(font_bold(13.5)).color(TEXT_PRIMARY));
+                    ui.label(RichText::new("Dispositivos de Áudio (PipeWire Linux)").font(font_bold(FS_BODY)).color(TEXT_PRIMARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_tool_button(ui, Icon::Refresh, 24.0, "Atualizar lista", false, BORDER_SUBTLE).clicked() {
                             self.input_devices = AudioEngine::list_input_devices();
@@ -977,10 +964,10 @@ impl RustSipApp {
                         }
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(SP2);
 
                 // Microfone
-                ui.label(RichText::new("Entrada de Microfone:").font(font_bold(11.5)).color(TEXT_SECONDARY));
+                ui.label(RichText::new("Entrada de Microfone:").font(font_bold(FS_CAPTION)).color(TEXT_SECONDARY));
                 let def_in = self
                     .input_devices
                     .iter()
@@ -1017,10 +1004,10 @@ impl RustSipApp {
                         }
                     });
 
-                ui.add_space(8.0);
+                ui.add_space(SP2);
 
                 // Fone / Saída
-                ui.label(RichText::new("Saída de Áudio:").font(font_bold(11.5)).color(TEXT_SECONDARY));
+                ui.label(RichText::new("Saída de Áudio:").font(font_bold(FS_CAPTION)).color(TEXT_SECONDARY));
                 let def_out = self
                     .output_devices
                     .iter()
@@ -1061,7 +1048,7 @@ impl RustSipApp {
 
                 // Sliders de ganho e volume
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ganho Mic:").font(font(12.0)).color(TEXT_SECONDARY));
+                    ui.label(RichText::new("Ganho Mic:").font(font(FS_LABEL)).color(TEXT_SECONDARY));
                     if ui.add(egui::Slider::new(&mut self.config.audio.mic_gain, 0.2..=3.0).text("x")).changed() {
                         self.audio.state.set_mic_gain(self.config.audio.mic_gain);
                         self.config.save();
@@ -1069,7 +1056,7 @@ impl RustSipApp {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Volume:").font(font(12.0)).color(TEXT_SECONDARY));
+                    ui.label(RichText::new("Volume:").font(font(FS_LABEL)).color(TEXT_SECONDARY));
                     if ui.add(egui::Slider::new(&mut self.config.audio.speaker_volume, 0.1..=2.5).text("x")).changed() {
                         self.audio.state.set_speaker_volume(self.config.audio.speaker_volume);
                         self.config.save();
@@ -1130,7 +1117,7 @@ impl RustSipApp {
                 let is_sel = self.log_filter == f;
                 let btn = egui::Button::new(
                     RichText::new(lbl)
-                        .font(font_bold(11.0))
+                        .font(font_bold(FS_CAPTION))
                         .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
                 )
                 .fill(if is_sel { BG_ACTIVE } else { BG_CARD })
@@ -1162,7 +1149,7 @@ impl RustSipApp {
 
         if let Some(addr) = pub_addr {
             ui.add_space(2.0);
-            ui.label(RichText::new(format!("NAT Público Detectado: {}", addr)).font(font_mono(10.5)).color(ACCENT_BLUE));
+            ui.label(RichText::new(format!("NAT Público Detectado: {}", addr)).font(font_mono(FS_MICRO)).color(ACCENT_BLUE));
         }
 
         ui.add_space(6.0);
@@ -1185,7 +1172,7 @@ impl RustSipApp {
                 .max_height(200.0)
                 .show(ui, |ui| {
                     if filtered_logs.is_empty() {
-                        ui.label(RichText::new("Nenhum registro para o filtro atual.").font(font(12.0)).color(TEXT_MUTED));
+                        ui.label(RichText::new("Nenhum registro para o filtro atual.").font(font(FS_LABEL)).color(TEXT_MUTED));
                     }
 
                     for (idx, entry) in filtered_logs {
@@ -1199,10 +1186,10 @@ impl RustSipApp {
 
                         let row_resp = ui.horizontal(|ui| {
                             status_chip(ui, entry.direction, badge_col);
-                            ui.label(RichText::new(&entry.timestamp).font(font_mono(10.0)).color(TEXT_MUTED));
+                            ui.label(RichText::new(&entry.timestamp).font(font_mono(FS_MICRO)).color(TEXT_MUTED));
                             ui.label(
                                 RichText::new(&entry.summary)
-                                    .font(font(11.5))
+                                    .font(font(FS_CAPTION))
                                     .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
                             );
                         }).response;
@@ -1225,14 +1212,14 @@ impl RustSipApp {
             .unwrap_or("Selecione um evento para exibir o pacote SIP bruto.");
 
         card_frame().show(ui, |ui| {
-            ui.label(RichText::new("Mensagem SIP Bruta:").font(font_bold(11.5)).color(TEXT_SECONDARY));
-            ui.add_space(4.0);
+            ui.label(RichText::new("Mensagem SIP Bruta:").font(font_bold(FS_CAPTION)).color(TEXT_SECONDARY));
+            ui.add_space(SP1);
             egui::ScrollArea::vertical()
                 .id_salt("sip_raw_scroll")
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut raw_content.to_string())
-                            .font(font_mono(10.5))
+                            .font(font_mono(FS_MICRO))
                             .text_color(TEXT_PRIMARY)
                             .desired_width(ui.available_width())
                             .desired_rows(8)
