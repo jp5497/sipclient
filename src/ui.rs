@@ -10,14 +10,15 @@ use crate::theme::{
     TEXT_SECONDARY,
 };
 use chrono::Local;
-use eframe::egui::{self, CornerRadius, Id, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, CornerRadius, RichText, Sense, Stroke, UiBuilder, Vec2};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 // Animações sóbrias (app corporativo): transições curtas ease-out, sem bounce.
 // ANIM_ENABLED=false desliga tudo (fallback de reduced-motion).
 const ANIM_ENABLED: bool = true;
-const ANIM_TAB_SECS: f32 = 0.15; // fade-in da troca de aba (~150ms)
+const ANIM_TAB_SECS: f32 = 0.22; // slide+fade da troca de aba (~220ms, notável)
+const ANIM_TAB_DX: f32 = 28.0; // deslocamento horizontal do slide (px, sóbrio)
 const ANIM_OPEN_SECS: f32 = 0.22; // fade-in global na abertura (~220ms)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +28,19 @@ pub enum ActiveTab {
     History,
     Settings,
     SipLogs,
+}
+
+impl ActiveTab {
+    /// Índice estável na ordem da tab bar — usado p/ direção do slide de troca.
+    fn index(self) -> i32 {
+        match self {
+            ActiveTab::Dialpad => 0,
+            ActiveTab::Contacts => 1,
+            ActiveTab::History => 2,
+            ActiveTab::Settings => 3,
+            ActiveTab::SipLogs => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +88,11 @@ pub struct RustSipApp {
 
     // Animação: instante da primeira renderização (fade-in de abertura).
     started_at: Instant,
+
+    // Animação de troca de aba (slide direcional + fade).
+    last_tab: ActiveTab,
+    tab_anim_start: Instant,
+    tab_from_right: bool, // true = aba nova entra da direita (avançou)
 }
 
 impl RustSipApp {
@@ -136,6 +155,9 @@ impl RustSipApp {
             selected_log_index: None,
             status_toast: None,
             started_at: Instant::now(),
+            last_tab: active_tab,
+            tab_anim_start: Instant::now(),
+            tab_from_right: true,
         }
     }
 
@@ -312,29 +334,54 @@ impl eframe::App for RustSipApp {
                     ui.add_space(10.0);
                 }
 
-                // Fade-in da troca de aba (~150ms): o Id muda a cada aba, então o bool
-                // da aba nova começa em 0 e sobe a 1 → opacidade do conteúdo. animate_*
-                // agenda o repaint sozinho.
-                if ANIM_ENABLED {
-                    let a = ctx.animate_bool_with_time(
-                        Id::new(("tab_fade", self.active_tab)),
-                        true,
-                        ANIM_TAB_SECS,
-                    );
-                    ui.set_opacity(a);
+                // Troca de aba: detecta a mudança, define a direção pelo índice e
+                // reinicia o relógio da animação.
+                if self.active_tab != self.last_tab {
+                    self.tab_from_right = self.active_tab.index() > self.last_tab.index();
+                    self.tab_anim_start = Instant::now();
+                    self.last_tab = self.active_tab;
                 }
-                match self.active_tab {
-                    ActiveTab::Dialpad => self.render_dialpad_tab(ui, &call_phase),
-                    ActiveTab::Contacts => self.render_contacts_tab(ui),
-                    ActiveTab::History => self.render_history_tab(ui),
-                    ActiveTab::Settings => self.render_settings_tab(ui),
-                    ActiveTab::SipLogs => self.render_logs_tab(ui, ctx),
+
+                // Slide direcional + fade (~220ms, ease-out). O rect é TRANSLADADO em X
+                // mas mantém o MESMO tamanho → available_width() inalterado, sem reintroduzir
+                // corte horizontal. DX pequeno + fade disfarça a borda; CentralPanel clipa.
+                let t = if ANIM_ENABLED {
+                    (self.tab_anim_start.elapsed().as_secs_f32() / ANIM_TAB_SECS).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let call_phase_ref = &call_phase;
+                if t < 1.0 {
+                    let eased = 1.0 - (1.0 - t).powi(3); // ease-out cúbico
+                    let dir = if self.tab_from_right { 1.0 } else { -1.0 };
+                    let offset_x = dir * ANIM_TAB_DX * (1.0 - eased);
+                    let alpha = eased;
+                    ctx.request_repaint();
+
+                    let content_rect = ui.max_rect().translate(Vec2::new(offset_x, 0.0));
+                    ui.allocate_new_ui(UiBuilder::new().max_rect(content_rect), |ui| {
+                        ui.set_opacity(alpha);
+                        self.render_active_tab(ui, ctx, call_phase_ref);
+                    });
+                } else {
+                    self.render_active_tab(ui, ctx, call_phase_ref);
                 }
             });
     }
 }
 
 impl RustSipApp {
+    /// Despacha a renderização da aba ativa (extraído p/ reuso no caminho animado e estável).
+    fn render_active_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, call_phase: &CallPhase) {
+        match self.active_tab {
+            ActiveTab::Dialpad => self.render_dialpad_tab(ui, call_phase),
+            ActiveTab::Contacts => self.render_contacts_tab(ui),
+            ActiveTab::History => self.render_history_tab(ui),
+            ActiveTab::Settings => self.render_settings_tab(ui),
+            ActiveTab::SipLogs => self.render_logs_tab(ui, ctx),
+        }
+    }
+
     /// Cabeçalho Sério com Indicador Preciso de Status
     fn render_header(&mut self, ui: &mut egui::Ui, reg_status: &RegistrationStatus) {
         ui.horizontal(|ui| {
