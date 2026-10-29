@@ -249,4 +249,48 @@ mod tests {
             assert!(diff <= 1200, "sample={} decoded={} diff={}", sample, decoded, diff);
         }
     }
+
+    /// Verificação de POLARIDADE do decoder A-law (item 1 da auditoria de robustez).
+    ///
+    /// O roundtrip acima NÃO pega inversão de sinal: A-law é simétrico e a
+    /// tolerância ±1200 esconde um espelhamento. Este teste compara o SINAL
+    /// (não a magnitude) contra vetores conhecidos do decoder de referência
+    /// ITU-T G.711, Anexo A:
+    ///   - byte 0xD5 = menor amostra POSITIVA  -> +8
+    ///   - byte 0x55 = menor amostra NEGATIVA  -> -8
+    ///   - segmentos altos: 0xAA -> +32256, 0x2A -> -32256
+    ///   - 0x80 -> +5504, 0x00 -> -5504
+    ///
+    /// Conclusão da auditoria: a polaridade atual está CORRETA (0xD5>0, 0x55<0),
+    /// portanto nenhuma mudança no decoder — só este teste de regressão fixa o
+    /// contrato de sinal para que uma futura inversão falhe o build.
+    #[test]
+    fn test_alaw_polarity_itu_g711_vectors() {
+        // (byte A-law, amostra linear esperada) — valores do decoder ITU-T de referência.
+        let vectors: &[(u8, i16)] = &[
+            (0xD5, 8),       // menor positivo
+            (0x55, -8),      // menor negativo
+            (0xD4, 24),      // positivo próximo de zero
+            (0x54, -24),     // negativo próximo de zero
+            (0xAA, 32256),   // positivo de segmento alto
+            (0x2A, -32256),  // negativo de segmento alto
+            (0x80, 5504),    // positivo meio de escala
+            (0x00, -5504),   // negativo meio de escala
+        ];
+        for &(byte, expected) in vectors {
+            let got = alaw_to_linear(byte);
+            assert_eq!(
+                got, expected,
+                "A-law 0x{:02X}: esperado {} (sinal {}), obtido {} (sinal {}) -- POLARIDADE INVERTIDA?",
+                byte,
+                expected,
+                expected.signum(),
+                got,
+                got.signum()
+            );
+        }
+        // Reforço explícito de sinal nos dois bytes âncora.
+        assert!(alaw_to_linear(0xD5) > 0, "0xD5 deve decodificar POSITIVO");
+        assert!(alaw_to_linear(0x55) < 0, "0x55 deve decodificar NEGATIVO");
+    }
 }
