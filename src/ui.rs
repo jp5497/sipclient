@@ -558,8 +558,12 @@ impl RustSipApp {
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // Reserva à direita = 2 botões de 28px + os gaps reais de item_spacing
+                    // (input→btn→btn = 2 gaps). Evita estourar quando ambos aparecem.
+                    let sp = ui.spacing().item_spacing.x;
+                    let reserve = 28.0 * 2.0 + sp * 2.0;
                     let resp = ui.add_sized(
-                        Vec2::new(ui.available_width() - 65.0, 32.0),
+                        Vec2::new((ui.available_width() - reserve).max(0.0), 32.0),
                         egui::TextEdit::singleline(&mut self.dial_input)
                             .font(font_bold(FS_TITLE))
                             .text_color(TEXT_PRIMARY)
@@ -600,6 +604,10 @@ impl RustSipApp {
 
         for row in keys {
             ui.horizontal(|ui| {
+                // Zera o item_spacing do layout: o ÚNICO gap entre teclas é o nosso
+                // add_space(spacing) controlado, então key_w = (avail - spacing*2)/3
+                // fecha EXATO (senão item_spacing.x extra estoura a 3ª coluna).
+                ui.spacing_mut().item_spacing.x = 0.0;
                 for (i, (main_lbl, sub_lbl, ch)) in row.into_iter().enumerate() {
                     if i > 0 {
                         ui.add_space(spacing);
@@ -635,7 +643,9 @@ impl RustSipApp {
     /// Aba 2: Lista de Contatos
     fn render_contacts_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let search_w = ui.available_width() - 34.0;
+            // Reserva p/ o botão "novo contato" (28px) + o gap real de item_spacing.
+            let sp = ui.spacing().item_spacing.x;
+            let search_w = (ui.available_width() - (28.0 + sp)).max(0.0);
             egui::Frame::NONE
                 .fill(BG_INPUT)
                 .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
