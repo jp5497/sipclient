@@ -265,6 +265,7 @@ struct DigestChallenge {
     opaque: Option<String>,
     algorithm: String,
     is_proxy: bool,
+    stale: bool,
 }
 
 fn parse_digest_challenge(header_val: &str, is_proxy: bool) -> Option<DigestChallenge> {
@@ -282,6 +283,7 @@ fn parse_digest_challenge(header_val: &str, is_proxy: bool) -> Option<DigestChal
     let mut qop = None;
     let mut opaque = None;
     let mut algorithm = "MD5".to_string();
+    let mut stale = false;
 
     for part in split_auth_params(rest) {
         if let Some((k, v)) = part.split_once('=') {
@@ -297,6 +299,11 @@ fn parse_digest_challenge(header_val: &str, is_proxy: bool) -> Option<DigestChal
                 opaque = Some(val);
             } else if key.eq_ignore_ascii_case("algorithm") {
                 algorithm = val;
+            } else if key.eq_ignore_ascii_case("stale") {
+                // RFC 3261/2617: stale=true => nonce expirou, mas credenciais
+                // estavam corretas -> reautenticar com o nonce novo é válido
+                // (NÃO é senha errada).
+                stale = val.eq_ignore_ascii_case("true");
             }
         }
     }
@@ -308,6 +315,7 @@ fn parse_digest_challenge(header_val: &str, is_proxy: bool) -> Option<DigestChal
         opaque,
         algorithm,
         is_proxy,
+        stale,
     })
 }
 
@@ -532,16 +540,22 @@ fn extract_caller_display_and_user(from_header: &str) -> (String, String) {
     (display, user)
 }
 
-/// Descobre qual IP local da máquina Linux roteia para o servidor FreeSWITCH
-fn discover_local_ip_for(server_addr: SocketAddr) -> String {
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect(server_addr).is_ok() {
-            if let Ok(local) = sock.local_addr() {
-                return local.ip().to_string();
-            }
-        }
+/// Descobre qual IP local da máquina Linux roteia para o servidor FreeSWITCH.
+///
+/// Retorna `None` quando não foi possível determinar a rota (bind/connect UDP
+/// falhou). O chamador DEVE tratar `None` como erro visível e abortar a sessão —
+/// cair em "127.0.0.1" silenciosamente anuncia loopback em Via/Contact/SDP e
+/// quebra o registro/áudio sem nenhuma mensagem de erro.
+fn discover_local_ip_for(server_addr: SocketAddr) -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect(server_addr).ok()?;
+    let local = sock.local_addr().ok()?;
+    let ip = local.ip();
+    // Um IP não-especificado/loopback aqui não roteia para um servidor remoto real.
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
     }
-    "127.0.0.1".to_string()
+    Some(ip.to_string())
 }
 
 /// Extrai `received=` e `rport=` do cabeçalho Via retornado pelo FreeSWITCH
@@ -578,6 +592,7 @@ struct ActiveCallDialog {
     last_invite_branch: String,
     last_invite_uri: String,
     last_invite_auth_line: String,
+    last_invite_raw: String,
     is_incoming: bool,
     incoming_invite_via: Vec<String>,
     incoming_invite_cseq: String,
@@ -587,9 +602,139 @@ struct ActiveCallDialog {
     rtp_remote_addr: Option<SocketAddr>,
     negotiated_dtmf_pt: u8,
     connected_at: Option<Instant>,
-    auth_retried: bool,
+    auth_attempts: u32,
     input_dev: Option<String>,
     output_dev: Option<String>,
+}
+
+/// Dados que um `send_*` de REQUISIÇÃO CLIENTE devolve para o loop principal
+/// registrar uma transação cliente e poder retransmitir (RFC 3261 §17.1).
+/// Só usado em UDP — TCP é confiável e dispensa retransmissão.
+struct ClientTxn {
+    method: String,
+    cseq_num: u32,
+    branch: String,
+    raw: String,
+    // Próximo instante de reenvio e intervalo atual (dobra até T2).
+    next_fire: Instant,
+    interval: Duration,
+}
+
+// Temporizadores de transação SIP (RFC 3261 §17.1.1.1 / §17.1.2.1).
+const T1: Duration = Duration::from_millis(500); // RTT estimado inicial
+const T2: Duration = Duration::from_millis(4000); // teto do intervalo de reenvio
+// Teto absoluto por transação (~ 64*T1 = 32s é o ideal RFC; usamos um teto mais
+// curto para não prender a UI). Ao estourar, a transação é abandonada.
+const TXN_TOTAL_TIMEOUT: Duration = Duration::from_millis(8000);
+
+/// Tabela de transações cliente ativas aguardando resposta (apenas UDP).
+#[derive(Default)]
+struct TxTable {
+    txns: Vec<(ClientTxn, Instant)>, // (txn, criada_em)
+}
+
+impl TxTable {
+    /// Registra uma nova transação cliente para retransmissão.
+    fn register(&mut self, txn: ClientTxn) {
+        // Uma nova transação do mesmo método+cseq substitui a anterior
+        // (ex.: REGISTER reenviado com Authorization após 401).
+        self.txns
+            .retain(|(t, _)| !(t.method == txn.method && t.cseq_num == txn.cseq_num));
+        self.txns.push((txn, Instant::now()));
+    }
+
+    /// Remove a transação casada por CSeq (num+método). O branch do Via é
+    /// validado pelo chamador antes de chamar isto.
+    fn ack_response(&mut self, cseq_num: u32, method: &str) {
+        self.txns
+            .retain(|(t, _)| !(t.cseq_num == cseq_num && t.method.eq_ignore_ascii_case(method)));
+    }
+
+    /// Procura a transação que casa com CSeq num+método E branch do Via.
+    /// Retorna true se existe uma transação pendente correspondente.
+    fn matches(&self, cseq_num: u32, method: &str, branch: &str) -> bool {
+        self.txns.iter().any(|(t, _)| {
+            t.cseq_num == cseq_num
+                && t.method.eq_ignore_ascii_case(method)
+                && (branch.is_empty() || t.branch == branch)
+        })
+    }
+
+    /// Reenvia as transações vencidas; descarta (com log) as que estouraram o
+    /// teto total. Retorna o próximo instante em que algo precisa disparar.
+    fn tick(
+        &mut self,
+        now: Instant,
+        out_tx: &mpsc::UnboundedSender<String>,
+        state: &Arc<SipSharedState>,
+    ) {
+        let mut expired = Vec::new();
+        for (txn, created) in self.txns.iter_mut() {
+            if now.duration_since(*created) >= TXN_TOTAL_TIMEOUT {
+                expired.push((txn.method.clone(), txn.cseq_num));
+                continue;
+            }
+            if now >= txn.next_fire {
+                let _ = out_tx.send(txn.raw.clone());
+                state.add_log(
+                    "TX",
+                    format!("Retransmissão {} (CSeq {})", txn.method, txn.cseq_num),
+                    "",
+                );
+                // Backoff exponencial com teto em T2 (RFC 3261 §17.1.2.1).
+                txn.interval = (txn.interval * 2).min(T2);
+                txn.next_fire = now + txn.interval;
+            }
+        }
+        if !expired.is_empty() {
+            self.txns.retain(|(_t, created)| {
+                now.duration_since(*created) < TXN_TOTAL_TIMEOUT
+            });
+            for (method, cseq) in expired {
+                state.add_log(
+                    "ERR",
+                    format!(
+                        "Transação {} (CSeq {}) sem resposta — abandonada após {}ms",
+                        method,
+                        cseq,
+                        TXN_TOTAL_TIMEOUT.as_millis()
+                    ),
+                    "",
+                );
+            }
+        }
+    }
+}
+
+/// Monta uma `ClientTxn` a partir de um pacote já construído.
+fn make_txn(method: &str, cseq_num: u32, branch: &str, raw: &str) -> ClientTxn {
+    ClientTxn {
+        method: method.to_string(),
+        cseq_num,
+        branch: branch.to_string(),
+        raw: raw.to_string(),
+        next_fire: Instant::now() + T1,
+        interval: T1,
+    }
+}
+
+/// Extrai o `branch` do primeiro (topo) cabeçalho Via de uma mensagem.
+fn top_via_branch(msg: &SipMessage) -> String {
+    let Some(via) = msg.header("Via") else {
+        return String::new();
+    };
+    for part in via.split(';') {
+        let p = part.trim();
+        if let Some(b) = p.strip_prefix("branch=") {
+            return b.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extrai o número do CSeq (primeiro token) de uma mensagem.
+fn cseq_num(msg: &SipMessage) -> Option<u32> {
+    msg.header("CSeq")?.split_whitespace().next()?.parse().ok()
 }
 
 async fn run_sip_supervisor(
@@ -665,9 +810,25 @@ async fn run_active_session(
         }
     };
 
-    let local_ip = discover_local_ip_for(server_addr);
+    let local_ip = match discover_local_ip_for(server_addr) {
+        Some(ip) => ip,
+        None => {
+            let msg = format!(
+                "Não foi possível determinar o IP local de rota para {} \
+                 (verifique conectividade de rede/rota). Sessão abortada para \
+                 evitar anunciar 127.0.0.1 em Via/Contact/SDP.",
+                server_addr
+            );
+            state.add_log("ERR", &msg, "");
+            state.set_reg_status(RegistrationStatus::Failed(msg));
+            return;
+        }
+    };
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<String>();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    // Sinaliza ao loop principal que o transporte caiu (ex.: TCP fechado pelo
+    // servidor). Sem isso o estado fica "Registrado" fantasma para sempre.
+    let (link_down_tx, mut link_down_rx) = mpsc::unbounded_channel::<String>();
 
     // Inicializa Transporte UDP ou TCP
     let local_port: u16;
@@ -734,6 +895,7 @@ async fn run_active_session(
             let (mut reader, mut writer) = stream.into_split();
             let net_tx_tcp = net_tx.clone();
             let state_tcp = state.clone();
+            let link_down_tcp = link_down_tx.clone();
 
             transport_task = tokio::spawn(async move {
                 let mut stream_buf: Vec<u8> = Vec::with_capacity(16384);
@@ -743,6 +905,9 @@ async fn run_active_session(
                     tokio::select! {
                         Some(pkt) = out_rx.recv() => {
                             if writer.write_all(pkt.as_bytes()).await.is_err() {
+                                let _ = link_down_tcp.send(
+                                    "Falha ao escrever na conexão TCP (conexão perdida)".to_string(),
+                                );
                                 break;
                             }
                         }
@@ -750,6 +915,9 @@ async fn run_active_session(
                             match res {
                                 Ok(0) | Err(_) => {
                                     state_tcp.add_log("ERR", "Conexão TCP encerrada pelo servidor", "");
+                                    let _ = link_down_tcp.send(
+                                        "Conexão TCP encerrada pelo servidor".to_string(),
+                                    );
                                     break;
                                 }
                                 Ok(n) => {
@@ -774,12 +942,16 @@ async fn run_active_session(
     let mut reg_cseq: u32 = 1;
     let mut last_auth_challenge: Option<DigestChallenge> = None;
     let mut auth_nc: u32 = 1;
-    let mut reg_auth_retried = false;
+    let mut reg_auth_attempts: u32 = 0;
 
     let mut active_call: Option<ActiveCallDialog> = None;
 
+    // Retransmissão de transações cliente (RFC 3261 §17.1) — só UDP.
+    let is_udp = account.transport == TransportProtocol::Udp;
+    let mut tx_table = TxTable::default();
+
     // Envia primeiro REGISTER
-    send_register(
+    let (reg_branch, reg_raw) = send_register(
         &account,
         &domain,
         &contact_ip,
@@ -793,6 +965,9 @@ async fn run_active_session(
         &out_tx,
         state,
     );
+    if is_udp {
+        tx_table.register(make_txn("REGISTER", reg_cseq, &reg_branch, &reg_raw));
+    }
 
     let re_reg_secs = (account.register_expires.max(60) as u64 * 2) / 3;
     let mut re_reg_timer = tokio::time::interval(Duration::from_secs(re_reg_secs));
@@ -801,11 +976,40 @@ async fn run_active_session(
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(25));
     keepalive_timer.tick().await;
 
+    // Varre a tabela de retransmissão a cada 100ms (resolução fina o bastante
+    // para T1=500ms). Sem efeito quando a tabela está vazia / em TCP.
+    let mut retransmit_timer = tokio::time::interval(Duration::from_millis(100));
+    retransmit_timer.tick().await;
+
     loop {
         tokio::select! {
+            _ = retransmit_timer.tick(), if is_udp => {
+                tx_table.tick(Instant::now(), &out_tx, state);
+            }
+            Some(reason) = link_down_rx.recv() => {
+                // Transporte caiu: limpa o estado "Registrado" fantasma e
+                // encerra qualquer chamada ativa. A reconexão automática com
+                // backoff NÃO está implementada (ver pendência no relatório) —
+                // o usuário precisa reconectar manualmente por ora.
+                state.add_log("ERR", format!("Conexão perdida: {}", reason), "");
+                if let Some(ref dialog) = active_call {
+                    if let Some(ref h) = dialog.rtp_handle {
+                        h.stop();
+                    }
+                }
+                audio.stop_audio();
+                state.set_call_phase(CallPhase::Idle);
+                let _ = active_call.take();
+                state.set_reg_status(RegistrationStatus::Failed(format!(
+                    "Conexão perdida: {}. Reconecte para registrar novamente.",
+                    reason
+                )));
+                transport_task.abort();
+                break;
+            }
             _ = re_reg_timer.tick() => {
                 reg_cseq += 1;
-                reg_auth_retried = false;
+                reg_auth_attempts = 0;
                 send_register(
                     &account,
                     &domain,
@@ -849,10 +1053,24 @@ async fn run_active_session(
                     let status = msg.status_code().unwrap_or(0);
                     let cseq_method = msg.cseq_method().unwrap_or("");
 
+                    // RFC 3261 §17.1: qualquer resposta (provisória ou final) para
+                    // uma transação cliente pendente interrompe sua retransmissão.
+                    // Casamos por CSeq (num+método) E branch do Via — uma resposta
+                    // cujo CSeq/branch não casa nenhuma transação ativa é ignorada
+                    // para fins de retransmissão (item 6b).
+                    if is_udp {
+                        if let Some(rcseq) = cseq_num(&msg) {
+                            let rbranch = top_via_branch(&msg);
+                            if tx_table.matches(rcseq, cseq_method, &rbranch) {
+                                tx_table.ack_response(rcseq, cseq_method);
+                            }
+                        }
+                    }
+
                     if cseq_method.eq_ignore_ascii_case("REGISTER") {
                         match status {
                             200 => {
-                                reg_auth_retried = false;
+                                reg_auth_attempts = 0;
                                 state.set_reg_status(RegistrationStatus::Registered);
                             }
                             401 | 407 => {
@@ -862,14 +1080,36 @@ async fn run_active_session(
                                 let is_proxy = status == 407 || msg.header("Proxy-Authenticate").is_some();
                                 if let Some(hval) = hdr {
                                     if let Some(chal) = parse_digest_challenge(hval, is_proxy) {
-                                        if last_auth_challenge.as_ref().map(|c| &c.nonce) != Some(&chal.nonce) {
+                                        let nonce_changed = last_auth_challenge
+                                            .as_ref()
+                                            .map(|c| &c.nonce)
+                                            != Some(&chal.nonce);
+                                        if nonce_changed {
                                             auth_nc = 1;
                                         }
+                                        // stale=true (ou nonce novo) significa que o servidor
+                                        // pede reautenticação com nonce fresco — NÃO é senha
+                                        // recusada. Permite uma tentativa extra sem estourar
+                                        // o teto de forma a não entrar em loop.
+                                        let stale_retry = chal.stale && nonce_changed;
                                         last_auth_challenge = Some(chal.clone());
-                                        if !reg_auth_retried {
-                                            reg_auth_retried = true;
+
+                                        // Teto de 2 tentativas autenticadas por ciclo; stale
+                                        // com nonce novo concede +1 (até no máx. 2).
+                                        let may_retry = reg_auth_attempts < 1
+                                            || (stale_retry && reg_auth_attempts < 2);
+
+                                        if may_retry {
+                                            reg_auth_attempts += 1;
                                             reg_cseq += 1;
-                                            send_register(
+                                            if stale_retry {
+                                                state.add_log(
+                                                    "INFO",
+                                                    "REGISTER: nonce expirado (stale), reautenticando",
+                                                    "",
+                                                );
+                                            }
+                                            let (rb, rr) = send_register(
                                                 &account,
                                                 &domain,
                                                 &contact_ip,
@@ -883,6 +1123,13 @@ async fn run_active_session(
                                                 &out_tx,
                                                 state,
                                             );
+                                            // nota: a resposta anterior já parou a
+                                            // transação antiga; registra a nova.
+                                            if is_udp {
+                                                tx_table.register(make_txn(
+                                                    "REGISTER", reg_cseq, &rb, &rr,
+                                                ));
+                                            }
                                         } else {
                                             state.set_reg_status(RegistrationStatus::Failed(
                                                 "Usuário ou senha recusados (401/407)".to_string(),
@@ -907,7 +1154,17 @@ async fn run_active_session(
                     } else if cseq_method.eq_ignore_ascii_case("INVITE") {
                         if let Some(ref mut dialog) = active_call {
                             let msg_call_id = msg.header("Call-ID").unwrap_or("");
-                            if msg_call_id == dialog.call_id {
+                            // Item 6b: além do Call-ID, valida CSeq (num) e o branch
+                            // do Via — uma resposta de uma transação INVITE antiga
+                            // (ex.: antes do re-INVITE autenticado) tem branch/CSeq
+                            // diferentes e deve ser IGNORADA, não aplicada ao diálogo.
+                            let resp_cseq = cseq_num(&msg);
+                            let resp_branch = top_via_branch(&msg);
+                            let cseq_ok = resp_cseq == Some(dialog.cseq);
+                            let branch_ok = dialog.last_invite_branch.is_empty()
+                                || resp_branch.is_empty()
+                                || resp_branch == dialog.last_invite_branch;
+                            if msg_call_id == dialog.call_id && cseq_ok && branch_ok {
                                 if let Some(to_hdr) = msg.header("To") {
                                     if let Some(t) = extract_tag(to_hdr) {
                                         dialog.remote_tag = Some(t);
@@ -985,16 +1242,34 @@ async fn run_active_session(
 
                                         if let Some(hval) = hdr {
                                             if let Some(chal) = parse_digest_challenge(hval, is_proxy) {
-                                                if last_auth_challenge.as_ref().map(|c| &c.nonce) != Some(&chal.nonce) {
+                                                let nonce_changed = last_auth_challenge
+                                                    .as_ref()
+                                                    .map(|c| &c.nonce)
+                                                    != Some(&chal.nonce);
+                                                if nonce_changed {
                                                     auth_nc = 1;
                                                 }
+                                                let stale_retry = chal.stale && nonce_changed;
                                                 last_auth_challenge = Some(chal.clone());
-                                                if !dialog.auth_retried {
-                                                    dialog.auth_retried = true;
+
+                                                // Teto de 2 INVITEs autenticados; stale com
+                                                // nonce novo concede a tentativa extra.
+                                                let may_retry = dialog.auth_attempts < 1
+                                                    || (stale_retry && dialog.auth_attempts < 2);
+
+                                                if may_retry {
+                                                    dialog.auth_attempts += 1;
                                                     dialog.cseq += 1;
                                                     dialog.remote_tag = None;
                                                     dialog.to_header =
                                                         format!("<{}>", dialog.last_invite_uri);
+                                                    if stale_retry {
+                                                        state.add_log(
+                                                            "INFO",
+                                                            "INVITE: nonce expirado (stale), reautenticando",
+                                                            "",
+                                                        );
+                                                    }
                                                     send_invite(
                                                         &account,
                                                         &domain,
@@ -1006,6 +1281,13 @@ async fn run_active_session(
                                                         &out_tx,
                                                         state,
                                                     );
+                                                    if is_udp {
+                                                        let b = dialog.last_invite_branch.clone();
+                                                        tx_table.register(make_txn(
+                                                            "INVITE", dialog.cseq, &b,
+                                                            &dialog.last_invite_raw,
+                                                        ));
+                                                    }
                                                 } else {
                                                     audio.stop_audio();
                                                     state.set_call_phase(CallPhase::Idle);
@@ -1204,6 +1486,7 @@ async fn run_active_session(
                                 last_invite_branch: String::new(),
                                 last_invite_uri: String::new(),
                                 last_invite_auth_line: String::new(),
+                                last_invite_raw: String::new(),
                                 is_incoming: true,
                                 incoming_invite_via: vias,
                                 incoming_invite_cseq: cseq_hdr,
@@ -1213,7 +1496,7 @@ async fn run_active_session(
                                 rtp_remote_addr: None,
                                 negotiated_dtmf_pt: 101,
                                 connected_at: None,
-                                auth_retried: false,
+                                auth_attempts: 0,
                                 input_dev: current_in_dev.clone(),
                                 output_dev: current_out_dev.clone(),
                             });
@@ -1379,6 +1662,7 @@ async fn run_active_session(
                             last_invite_branch: String::new(),
                             last_invite_uri: remote_uri,
                             last_invite_auth_line: String::new(),
+                            last_invite_raw: String::new(),
                             is_incoming: false,
                             incoming_invite_via: Vec::new(),
                             incoming_invite_cseq: String::new(),
@@ -1388,7 +1672,7 @@ async fn run_active_session(
                             rtp_remote_addr: None,
                             negotiated_dtmf_pt: 101,
                             connected_at: None,
-                            auth_retried: false,
+                            auth_attempts: 0,
                             input_dev: input_dev.clone(),
                             output_dev: output_dev.clone(),
                         };
@@ -1410,6 +1694,12 @@ async fn run_active_session(
                             &out_tx,
                             state,
                         );
+                        if is_udp {
+                            let b = dialog.last_invite_branch.clone();
+                            tx_table.register(make_txn(
+                                "INVITE", dialog.cseq, &b, &dialog.last_invite_raw,
+                            ));
+                        }
 
                         active_call = Some(dialog);
                     }
@@ -1496,7 +1786,7 @@ async fn run_active_session(
                             }
                             if dialog.connected_at.is_some() {
                                 // Chamada já estabelecida -> envia BYE
-                                send_bye(
+                                let (bye_branch, bye_cseq, bye_raw) = send_bye(
                                     &account,
                                     &contact_ip,
                                     contact_port,
@@ -1506,6 +1796,11 @@ async fn run_active_session(
                                     &out_tx,
                                     state,
                                 );
+                                if is_udp {
+                                    tx_table.register(make_txn(
+                                        "BYE", bye_cseq, &bye_branch, &bye_raw,
+                                    ));
+                                }
                             } else if dialog.is_incoming {
                                 // Chamada recebida tocando -> rejeita com 486 Busy Here
                                 send_dialog_response(
@@ -1642,7 +1937,7 @@ fn send_register(
     auth_nc: &mut u32,
     out_tx: &mpsc::UnboundedSender<String>,
     state: &Arc<SipSharedState>,
-) {
+) -> (String, String) {
     let branch = format!("z9hG4bK-{}", random_hex(12));
     let tp = account.transport.as_str();
     let tp_param = if account.transport == TransportProtocol::Tcp {
@@ -1689,7 +1984,8 @@ fn send_register(
     );
 
     state.add_log("TX", format!("REGISTER {} (CSeq {})", uri, cseq), &msg);
-    let _ = out_tx.send(msg);
+    let _ = out_tx.send(msg.clone());
+    (branch, msg)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1703,7 +1999,7 @@ fn send_invite(
     auth_nc: &mut u32,
     out_tx: &mpsc::UnboundedSender<String>,
     state: &Arc<SipSharedState>,
-) {
+) -> String {
     let branch = format!("z9hG4bK-{}", random_hex(12));
     dialog.last_invite_branch = branch.clone();
     let tp = account.transport.as_str();
@@ -1762,7 +2058,9 @@ fn send_invite(
     );
 
     state.add_log("TX", format!("INVITE {} (CSeq {})", uri, dialog.cseq), &msg);
-    let _ = out_tx.send(msg);
+    let _ = out_tx.send(msg.clone());
+    dialog.last_invite_raw = msg.clone();
+    msg
 }
 
 fn send_non_2xx_ack(
@@ -1879,7 +2177,7 @@ fn send_bye(
     auth_nc: &mut u32,
     out_tx: &mpsc::UnboundedSender<String>,
     state: &Arc<SipSharedState>,
-) {
+) -> (String, u32, String) {
     dialog.cseq += 1;
     let branch = format!("z9hG4bK-{}", random_hex(12));
     let tp = account.transport.as_str();
@@ -1923,7 +2221,8 @@ fn send_bye(
     );
 
     state.add_log("TX", format!("BYE {}", uri), &msg);
-    let _ = out_tx.send(msg);
+    let _ = out_tx.send(msg.clone());
+    (branch, dialog.cseq, msg)
 }
 
 fn send_sip_info_dtmf(
@@ -2120,5 +2419,92 @@ mod tests {
         assert_eq!(info.remote_port, 18442);
         assert_eq!(info.codec, AudioCodec::Pcma);
         assert_eq!(info.dtmf_pt, 101);
+    }
+
+    // ---- Item 4: parse de `stale` no desafio Digest ----
+    #[test]
+    fn test_digest_stale_parsing() {
+        let with_stale = r#"Digest realm="fs", nonce="abc", algorithm=MD5, stale=true"#;
+        let c = parse_digest_challenge(with_stale, false).expect("parseia");
+        assert!(c.stale, "stale=true deve virar true");
+
+        let with_stale_false = r#"Digest realm="fs", nonce="abc", stale=false"#;
+        let c2 = parse_digest_challenge(with_stale_false, false).expect("parseia");
+        assert!(!c2.stale);
+
+        let no_stale = r#"Digest realm="fs", nonce="abc""#;
+        let c3 = parse_digest_challenge(no_stale, false).expect("parseia");
+        assert!(!c3.stale, "ausência de stale => false (default)");
+    }
+
+    // ---- Item 6b: extratores de CSeq e branch do Via ----
+    #[test]
+    fn test_cseq_and_branch_extractors() {
+        let raw = "SIP/2.0 200 OK\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-abc123;rport=5060\r\n\
+                   CSeq: 42 INVITE\r\n\
+                   Content-Length: 0\r\n\r\n";
+        let msg = SipMessage::parse(raw).expect("parseia");
+        assert_eq!(cseq_num(&msg), Some(42));
+        assert_eq!(top_via_branch(&msg), "z9hG4bK-abc123");
+    }
+
+    // ---- Item 6a: TxTable casa por CSeq+método+branch, faz ack e retransmite ----
+    #[test]
+    fn test_txtable_match_and_ack() {
+        let mut t = TxTable::default();
+        t.register(make_txn("INVITE", 42, "z9hG4bK-abc123", "INVITE sip:x SIP/2.0\r\n\r\n"));
+
+        // Casa com CSeq+método+branch corretos.
+        assert!(t.matches(42, "INVITE", "z9hG4bK-abc123"));
+        // NÃO casa se o branch for de outra transação.
+        assert!(!t.matches(42, "INVITE", "z9hG4bK-OUTRO"));
+        // NÃO casa com método/cseq diferentes.
+        assert!(!t.matches(42, "BYE", "z9hG4bK-abc123"));
+        assert!(!t.matches(99, "INVITE", "z9hG4bK-abc123"));
+
+        // ack remove a transação -> deixa de casar.
+        t.ack_response(42, "INVITE");
+        assert!(!t.matches(42, "INVITE", "z9hG4bK-abc123"));
+    }
+
+    #[test]
+    fn test_txtable_register_replaces_same_cseq() {
+        // Um REGISTER reenviado com Authorization (mesmo método+cseq) substitui
+        // a transação anterior em vez de acumular duas.
+        let mut t = TxTable::default();
+        t.register(make_txn("REGISTER", 1, "b1", "REGISTER v1"));
+        t.register(make_txn("REGISTER", 1, "b2", "REGISTER v2"));
+        assert_eq!(t.txns.len(), 1, "mesmo método+cseq não deve duplicar");
+        // A entrada vigente é a v2 (branch b2).
+        assert!(t.matches(1, "REGISTER", "b2"));
+        assert!(!t.matches(1, "REGISTER", "b1"));
+    }
+
+    #[test]
+    fn test_txtable_retransmits_due_then_stops() {
+        use std::thread::sleep;
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let state = SipSharedState::new(RtpStats::new());
+
+        let mut t = TxTable::default();
+        t.register(make_txn("INVITE", 7, "br7", "INVITE sip:x SIP/2.0\r\n\r\n"));
+
+        // Antes de T1 (500ms) nada deve ser reenviado.
+        t.tick(Instant::now(), &tx, &state);
+        assert!(rx.try_recv().is_err(), "não reenvia antes de T1");
+
+        // Após T1, um tick reenvia exatamente 1 vez.
+        sleep(T1 + Duration::from_millis(60));
+        t.tick(Instant::now(), &tx, &state);
+        assert!(rx.try_recv().is_ok(), "deve reenviar após T1");
+        assert!(rx.try_recv().is_err(), "apenas 1 reenvio por tick vencido");
+
+        // Chegou a resposta casando CSeq+método+branch -> para de reenviar.
+        assert!(t.matches(7, "INVITE", "br7"));
+        t.ack_response(7, "INVITE");
+        sleep(T1 + Duration::from_millis(60));
+        t.tick(Instant::now(), &tx, &state);
+        assert!(rx.try_recv().is_err(), "após ack não reenvia mais");
     }
 }

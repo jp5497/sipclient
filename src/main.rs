@@ -1,6 +1,7 @@
 mod audio;
 mod codec;
 mod config;
+mod crypto;
 mod rtp;
 mod sip;
 mod theme;

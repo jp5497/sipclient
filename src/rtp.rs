@@ -104,32 +104,70 @@ async fn query_stun_rfc5389(
         return Ok(None);
     };
 
-    // Monta STUN Binding Request (20 bytes)
-    let mut req = [0u8; 20];
-    req[0] = 0x00;
-    req[1] = 0x01; // Binding Request
-    req[2] = 0x00;
-    req[3] = 0x00; // Message Length = 0
-    // Magic Cookie: 0x2112A442
-    req[4] = 0x21;
-    req[5] = 0x12;
-    req[6] = 0xA4;
-    req[7] = 0x42;
-    // Transaction ID (12 bytes)
-    rand::thread_rng().fill(&mut req[8..20]);
-
-    sock.send_to(&req, stun_addr).await?;
+    // Retransmissão RFC 5389 §7.2.1: STUN sobre UDP é não-confiável, então
+    // reenviamos a Binding Request algumas vezes com backoff curto antes de
+    // desistir. Sem retry, um único datagrama perdido (comum em NAT) faz a
+    // descoberta cair no IP local -> áudio one-way. Teto total ~2.3s para não
+    // travar a discagem (650 + 850 + 800ms de espera).
+    const ATTEMPT_TIMEOUTS_MS: [u64; 3] = [650, 850, 800];
 
     let mut buf = [0u8; 512];
-    let recv_res = tokio::time::timeout(Duration::from_millis(650), sock.recv_from(&mut buf)).await;
-    let Ok(Ok((len, _from))) = recv_res else {
-        return Ok(None);
-    };
+    for (attempt, &timeout_ms) in ATTEMPT_TIMEOUTS_MS.iter().enumerate() {
+        // Transaction ID NOVO por tentativa (uma resposta atrasada da tentativa
+        // anterior não deve ser aceita como resposta desta).
+        let mut req = [0u8; 20];
+        req[0] = 0x00;
+        req[1] = 0x01; // Binding Request
+        req[2] = 0x00;
+        req[3] = 0x00; // Message Length = 0
+        // Magic Cookie: 0x2112A442
+        req[4] = 0x21;
+        req[5] = 0x12;
+        req[6] = 0xA4;
+        req[7] = 0x42;
+        // Transaction ID (12 bytes)
+        rand::thread_rng().fill(&mut req[8..20]);
+        let txid = req[8..20].to_vec();
 
-    if len < 20 || buf[0] != 0x01 || buf[1] != 0x01 {
-        return Ok(None);
+        if sock.send_to(&req, stun_addr).await.is_err() {
+            continue;
+        }
+
+        // Pode chegar lixo/resposta antiga antes da resposta correta: fica no
+        // laço até casar o transaction ID OU estourar o timeout desta tentativa.
+        let attempt_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let recv_res = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await;
+            let Ok(Ok((len, _from))) = recv_res else {
+                break; // timeout desta tentativa -> tenta a próxima
+            };
+
+            if len < 20 || buf[0] != 0x01 || buf[1] != 0x01 {
+                continue; // não é Binding Success Response
+            }
+            // Confere o Magic Cookie e o Transaction ID desta tentativa.
+            if buf[4..8] != [0x21, 0x12, 0xA4, 0x42] || buf[8..20] != txid[..] {
+                continue; // resposta de outra transação / atrasada
+            }
+
+            if let Some(mapped) = parse_stun_mapped_address(&buf, len) {
+                return Ok(Some(mapped));
+            }
+            // Resposta válida mas sem endereço mapeável: não adianta reenviar.
+            return Ok(None);
+        }
+        let _ = attempt; // documenta intenção; backoff é o próprio timeout crescente
     }
 
+    Ok(None)
+}
+
+/// Extrai XOR-MAPPED-ADDRESS (ou MAPPED-ADDRESS legado) de uma resposta STUN.
+fn parse_stun_mapped_address(buf: &[u8], len: usize) -> Option<SocketAddr> {
     let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     let end = (20 + msg_len).min(len);
     let mut pos = 20;
@@ -154,7 +192,7 @@ async fn query_stun_rfc5389(
                     buf[pos + 6] ^ 0xA4,
                     buf[pos + 7] ^ 0x42,
                 );
-                return Ok(Some(SocketAddr::new(IpAddr::V4(ip), port)));
+                return Some(SocketAddr::new(IpAddr::V4(ip), port));
             }
         } else if attr_type == 0x0001 && attr_len >= 8 {
             // 0x0001 = MAPPED-ADDRESS
@@ -162,7 +200,7 @@ async fn query_stun_rfc5389(
             if family == 0x01 {
                 let port = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
                 let ip = Ipv4Addr::new(buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]);
-                return Ok(Some(SocketAddr::new(IpAddr::V4(ip), port)));
+                return Some(SocketAddr::new(IpAddr::V4(ip), port));
             }
         }
 
@@ -171,7 +209,7 @@ async fn query_stun_rfc5389(
         pos += padded_len;
     }
 
-    Ok(None)
+    None
 }
 
 pub struct RtpSessionHandle {
@@ -366,4 +404,51 @@ pub fn spawn_rtp_session(
     });
 
     RtpSessionHandle { stop_tx, dtmf_tx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Monta uma Binding Success Response STUN com XOR-MAPPED-ADDRESS e verifica
+    /// que o parser decodifica IP/porta corretamente (item 3 — retry STUN).
+    #[test]
+    fn test_parse_stun_xor_mapped_address() {
+        // IP público fictício 203.0.113.7, porta 54321.
+        let real_ip = [203u8, 0, 113, 7];
+        let real_port: u16 = 54321;
+
+        let mut buf = Vec::new();
+        // Cabeçalho STUN (20 bytes): tipo 0x0101 (Binding Success), len=12
+        buf.extend_from_slice(&[0x01, 0x01, 0x00, 0x0C]);
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
+        buf.extend_from_slice(&[0u8; 12]); // transaction id (irrelevante p/ o parser)
+
+        // Atributo XOR-MAPPED-ADDRESS (0x0020), len=8
+        buf.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+        buf.push(0x00); // reserved
+        buf.push(0x01); // family IPv4
+        let xport = real_port ^ 0x2112;
+        buf.extend_from_slice(&xport.to_be_bytes());
+        buf.push(real_ip[0] ^ 0x21);
+        buf.push(real_ip[1] ^ 0x12);
+        buf.push(real_ip[2] ^ 0xA4);
+        buf.push(real_ip[3] ^ 0x42);
+
+        let len = buf.len();
+        let mapped = parse_stun_mapped_address(&buf, len).expect("deve extrair endereço");
+        assert_eq!(mapped.ip().to_string(), "203.0.113.7");
+        assert_eq!(mapped.port(), 54321);
+    }
+
+    /// Resposta sem atributo de endereço => None (não entra em loop nem panica).
+    #[test]
+    fn test_parse_stun_no_address_attr() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x01, 0x00, 0x00]);
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        buf.extend_from_slice(&[0u8; 12]);
+        let len = buf.len();
+        assert!(parse_stun_mapped_address(&buf, len).is_none());
+    }
 }
