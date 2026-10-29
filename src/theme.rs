@@ -9,18 +9,19 @@
 //! TOKENS DO SISTEMA
 //! -----------------
 //! 1. COR — paleta por PAPEL semântico, não por matiz:
-//!      Superfícies ....... BG_APP < BG_PANEL < BG_CARD   (profundidade crescente)
-//!                          BG_INPUT (campos), BG_HOVER / BG_ACTIVE (estados)
-//!      Texto ............. TEXT_PRIMARY > TEXT_SECONDARY > TEXT_MUTED  (hierarquia)
-//!      Bordas ............ BORDER_SUBTLE (repouso), BORDER_FOCUS (foco/hover)
-//!      Acento ............ ACCENT_BLUE (ação primária / seleção)
-//!      Status ............ STATUS_GREEN (ok/ligar) · AMBER (atenção/mudo)
-//!                          · RED (erro/desligar)
+//!    - Superfícies: BG_APP < BG_PANEL < BG_CARD (profundidade crescente),
+//!      BG_INPUT (campos), BG_HOVER / BG_ACTIVE (estados).
+//!    - Texto: TEXT_PRIMARY > TEXT_SECONDARY > TEXT_MUTED (hierarquia).
+//!    - Bordas: BORDER_SUBTLE (repouso), BORDER_FOCUS (foco/hover).
+//!    - Acento: ACCENT_BLUE (ação primária / seleção).
+//!    - Status: STATUS_GREEN (ok/ligar) · AMBER (atenção/mudo) · RED (erro).
+//!      RED tem duas formas: STATUS_RED (#EF4444) p/ TEXTO/borda em superfície
+//!      escura, STATUS_RED_FILL (#DC2626) p/ FILL com texto branco (AA).
 //!
 //! 2. TIPOGRAFIA — escala com PROPÓSITO (não tamanhos aleatórios). Cada degrau
 //!    tem um uso. Pesos: regular (corpo) e semibold (títulos/ação/labels).
-//!      TITLE 20 · HEADING 16 · SUBHEAD 14 · BODY 13 · LABEL 12 · CAPTION 11
-//!      · MICRO 10 · MONO 12 (log/telemetria).  Dígitos do teclado = DIAL 20.
+//!    TITLE 20 · HEADING 16 · SUBHEAD 14 · BODY 13 · LABEL 12 · CAPTION 11 ·
+//!    MICRO 10 · MONO 12 (log/telemetria). Dígitos do teclado = DIAL 20.
 //!
 //! 3. ESPAÇAMENTO — grade de 4px. SP1=4 SP2=8 SP3=12 SP4=16 SP5=20 SP6=24.
 //!    Nunca usar folga crua; usar o degrau.
@@ -37,7 +38,8 @@
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+    Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, WidgetInfo,
+    WidgetType,
 };
 use std::sync::Arc;
 
@@ -59,7 +61,8 @@ pub const BORDER_FOCUS: Color32 = Color32::from_rgb(96, 165, 250); // #60A5FA fo
 pub const ACCENT_BLUE: Color32 = Color32::from_rgb(37, 99, 235); // #2563EB ação primária / seleção
 pub const STATUS_GREEN: Color32 = Color32::from_rgb(34, 197, 94); // #22C55E online / atender / ligar
 pub const STATUS_AMBER: Color32 = Color32::from_rgb(234, 142, 20); // #EA8E14 conectando / mudo (mais legível que #D97706)
-pub const STATUS_RED: Color32 = Color32::from_rgb(239, 68, 68); // #EF4444 desligar / erro (AA sobre card)
+pub const STATUS_RED: Color32 = Color32::from_rgb(239, 68, 68); // #EF4444 erro/desligar como TEXTO ou borda (4.42:1 no card)
+pub const STATUS_RED_FILL: Color32 = Color32::from_rgb(220, 38, 38); // #DC2626 FILL de botão vermelho + texto branco (AA 4.5:1+)
 
 // Texto (hierarquia de leitura)
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(248, 250, 252); // #F8FAFC primário — salta
@@ -516,6 +519,10 @@ pub fn dial_key(
     let p = ui.painter();
     p.rect_filled(rect, r(R_MD), bg);
     p.rect_stroke(rect, r(R_MD), Stroke::new(1.0_f32, border), StrokeKind::Inside);
+    // Anel de foco de teclado (Tab percorre as 12 teclas) — paridade com os demais botões.
+    if resp.has_focus() {
+        p.rect_stroke(rect, r(R_MD), Stroke::new(2.0_f32, BORDER_FOCUS), StrokeKind::Outside);
+    }
 
     let center = rect.center();
     if sub_label.is_empty() {
@@ -530,6 +537,12 @@ pub fn dial_key(
     resp
 }
 
+/// Mede a largura real (px) de um rótulo numa dada fonte — substitui a
+/// heurística `len() * fs * 0.52` (que errava com acentos/UTF-8 e textos longos).
+fn text_width(ui: &Ui, text: &str, font_id: FontId) -> f32 {
+    ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, Color32::WHITE).size().x)
+}
+
 /// Botão de ação primária preenchido (Ligar / Atender / Salvar...).
 pub fn action_button(
     ui: &mut Ui,
@@ -541,6 +554,8 @@ pub fn action_button(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // Expõe o rótulo ao leitor de tela (AccessKit) — paridade com egui::Button.
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, text));
 
     let is_down = resp.is_pointer_button_down_on();
     let is_hover = resp.hovered();
@@ -561,23 +576,28 @@ pub fn action_button(
     }
 
     let center = rect.center();
-    if let Some(ic) = icon {
-        // Ícone + rótulo agrupados e centrados como bloco (não ancorados nas bordas).
-        let label_w = text.len() as f32 * FS_SUBHEAD * 0.52;
-        let gap = 8.0;
-        let icon_sz = 16.0;
+    let font_id = font_bold(FS_SUBHEAD);
+    let label_w = text_width(ui, text, font_id.clone());
+    let icon_sz = 16.0;
+    let gap = 8.0;
+    // Só mostra o ícone se o bloco (ícone+gap+texto) couber na largura útil do botão.
+    let fits_icon = icon.is_some() && (icon_sz + gap + label_w) <= (width - 12.0);
+
+    let p = ui.painter();
+    if fits_icon {
         let block_w = icon_sz + gap + label_w;
         let icon_c = center - Vec2::new(block_w / 2.0 - icon_sz / 2.0, 0.0);
-        paint_icon(p, ic, icon_c, icon_sz, Color32::WHITE);
+        paint_icon(p, icon.unwrap(), icon_c, icon_sz, Color32::WHITE);
         p.text(
             Pos2::new(icon_c.x + icon_sz / 2.0 + gap, center.y),
             Align2::LEFT_CENTER,
             text,
-            font_bold(FS_SUBHEAD),
+            font_id,
             Color32::WHITE,
         );
     } else {
-        p.text(center, Align2::CENTER_CENTER, text, font_bold(FS_SUBHEAD), Color32::WHITE);
+        // Sem espaço para o ícone (ou sem ícone): centra só o texto.
+        p.text(center, Align2::CENTER_CENTER, text, font_id, Color32::WHITE);
     }
 
     resp
@@ -649,6 +669,8 @@ pub fn call_control_button(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // Expõe o rótulo ao leitor de tela (AccessKit) — paridade com egui::Button.
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
 
     let is_hover = resp.hovered();
     let is_down = resp.is_pointer_button_down_on();
@@ -681,18 +703,26 @@ pub fn call_control_button(
     // Ícone + rótulo agrupados e centrados como bloco.
     let icon_sz = 15.0;
     let gap = 8.0;
-    let label_w = label.len() as f32 * FS_LABEL * 0.52;
-    let block_w = icon_sz + gap + label_w;
+    let font_id = font_bold(FS_LABEL);
+    let label_w = text_width(ui, label, font_id.clone());
+    let fits_icon = (icon_sz + gap + label_w) <= (width - 12.0);
     let c = rect.center();
-    let icon_c = c - Vec2::new(block_w / 2.0 - icon_sz / 2.0, 0.0);
-    paint_icon(p, icon, icon_c, icon_sz, fg);
-    p.text(
-        Pos2::new(icon_c.x + icon_sz / 2.0 + gap, c.y),
-        Align2::LEFT_CENTER,
-        label,
-        font_bold(FS_LABEL),
-        fg,
-    );
+
+    let p = ui.painter();
+    if fits_icon {
+        let block_w = icon_sz + gap + label_w;
+        let icon_c = c - Vec2::new(block_w / 2.0 - icon_sz / 2.0, 0.0);
+        paint_icon(p, icon, icon_c, icon_sz, fg);
+        p.text(
+            Pos2::new(icon_c.x + icon_sz / 2.0 + gap, c.y),
+            Align2::LEFT_CENTER,
+            label,
+            font_id,
+            fg,
+        );
+    } else {
+        p.text(c, Align2::CENTER_CENTER, label, font_id, fg);
+    }
 
     resp
 }

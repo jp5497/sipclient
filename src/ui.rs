@@ -6,7 +6,8 @@ use crate::theme::{
     icon_tool_button, paint_icon, status_chip, tab_button, text_input, vu_meter, Icon,
     ACCENT_BLUE, BG_ACTIVE, BG_APP, BG_CARD, BG_INPUT, BG_PANEL, BORDER_FOCUS, BORDER_SUBTLE,
     FS_BODY, FS_CAPTION, FS_HEADING, FS_LABEL, FS_MICRO, FS_SUBHEAD, FS_TITLE, SP1, SP2, SP5,
-    STATUS_AMBER, STATUS_GREEN, STATUS_RED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    STATUS_AMBER, STATUS_GREEN, STATUS_RED, STATUS_RED_FILL, TEXT_MUTED, TEXT_PRIMARY,
+    TEXT_SECONDARY,
 };
 use chrono::Local;
 use eframe::egui::{self, CornerRadius, RichText, Sense, Stroke, Vec2};
@@ -445,7 +446,7 @@ impl RustSipApp {
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if action_button(ui, "Recusar", Some(Icon::Hangup), STATUS_RED, 88.0, 32.0).clicked() {
+                            if action_button(ui, "Recusar", Some(Icon::Hangup), STATUS_RED_FILL, 88.0, 32.0).clicked() {
                                 self.sip.send(SipCommand::Hangup);
                             }
                             if action_button(ui, "Atender", Some(Icon::Phone), STATUS_GREEN, 88.0, 32.0).clicked() {
@@ -469,7 +470,7 @@ impl RustSipApp {
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if action_button(ui, "Cancelar", Some(Icon::Hangup), STATUS_RED, 92.0, 32.0).clicked() {
+                            if action_button(ui, "Cancelar", Some(Icon::Hangup), STATUS_RED_FILL, 92.0, 32.0).clicked() {
                                 self.sip.send(SipCommand::Hangup);
                             }
                         });
@@ -499,7 +500,7 @@ impl RustSipApp {
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if action_button(ui, "Desligar", Some(Icon::Hangup), STATUS_RED, 92.0, 32.0).clicked() {
+                            if action_button(ui, "Desligar", Some(Icon::Hangup), STATUS_RED_FILL, 92.0, 32.0).clicked() {
                                 self.sip.send(SipCommand::Hangup);
                             }
                         });
@@ -514,6 +515,8 @@ impl RustSipApp {
                     let is_hold = self.audio.state.on_hold.load(Ordering::Relaxed);
 
                     ui.horizontal(|ui| {
+                        // Dois botões + o item_spacing.x (= SP2) do layout horizontal entre eles
+                        // = largura total. NÃO adicionar add_space extra (dobrava a folga → overflow).
                         let btn_w = (ui.available_width() - SP2) / 2.0;
 
                         // Mudo: Mic quando aberto, MicOff quando silenciado.
@@ -525,11 +528,9 @@ impl RustSipApp {
                             self.audio.state.muted.store(!is_muted, Ordering::Relaxed);
                         }
 
-                        ui.add_space(SP2);
-
-                        // Espera: Pause quando ativo, Play (retomar) quando em espera.
+                        // Espera: ação. Pause quando a chamada está ativa, Play (retomar) em espera.
                         let hold_icon = if is_hold { Icon::Play } else { Icon::Pause };
-                        let hold_label = if is_hold { "Retomar" } else { "Em espera" };
+                        let hold_label = if is_hold { "Retomar" } else { "Pôr em espera" };
                         if call_control_button(ui, hold_icon, hold_label, is_hold, ACCENT_BLUE, btn_w, 30.0)
                             .clicked()
                         {
@@ -1068,7 +1069,7 @@ impl RustSipApp {
                 // Teste de Loopback
                 let is_loopback = self.audio.state.mode.load(Ordering::Relaxed) == MODE_LOOPBACK_TEST;
                 let (test_txt, test_col) = if is_loopback {
-                    ("Parar Teste de Áudio", STATUS_RED)
+                    ("Parar Teste de Áudio", STATUS_RED_FILL)
                 } else {
                     ("Iniciar Teste de Microfone / Alto-falante", ACCENT_BLUE)
                 };
