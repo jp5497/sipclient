@@ -10,11 +10,17 @@ use crate::theme::{
     TEXT_SECONDARY,
 };
 use chrono::Local;
-use eframe::egui::{self, CornerRadius, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, CornerRadius, Id, RichText, Sense, Stroke, Vec2};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Animações sóbrias (app corporativo): transições curtas ease-out, sem bounce.
+// ANIM_ENABLED=false desliga tudo (fallback de reduced-motion).
+const ANIM_ENABLED: bool = true;
+const ANIM_TAB_SECS: f32 = 0.15; // fade-in da troca de aba (~150ms)
+const ANIM_OPEN_SECS: f32 = 0.22; // fade-in global na abertura (~220ms)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActiveTab {
     Dialpad,
     Contacts,
@@ -65,6 +71,9 @@ pub struct RustSipApp {
 
     // Notificação / Toast
     status_toast: Option<(String, Instant)>,
+
+    // Animação: instante da primeira renderização (fade-in de abertura).
+    started_at: Instant,
 }
 
 impl RustSipApp {
@@ -126,6 +135,7 @@ impl RustSipApp {
             log_filter: LogFilter::All,
             selected_log_index: None,
             status_toast: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -267,6 +277,16 @@ impl eframe::App for RustSipApp {
                     .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
+                // Fade-in global de abertura (~220ms, uma vez). set_opacity no root
+                // do painel central escurece tudo suavemente no primeiro quarto de segundo.
+                if ANIM_ENABLED {
+                    let e = self.started_at.elapsed().as_secs_f32();
+                    if e < ANIM_OPEN_SECS {
+                        let a = (e / ANIM_OPEN_SECS).clamp(0.0, 1.0);
+                        ui.set_opacity(a);
+                        ctx.request_repaint(); // mantém o fade fluido até completar
+                    }
+                }
                 // Toast discreto de notificação
                 if let Some((ref msg, ts)) = self.status_toast {
                     if ts.elapsed() < Duration::from_secs(3) {
@@ -292,6 +312,17 @@ impl eframe::App for RustSipApp {
                     ui.add_space(10.0);
                 }
 
+                // Fade-in da troca de aba (~150ms): o Id muda a cada aba, então o bool
+                // da aba nova começa em 0 e sobe a 1 → opacidade do conteúdo. animate_*
+                // agenda o repaint sozinho.
+                if ANIM_ENABLED {
+                    let a = ctx.animate_bool_with_time(
+                        Id::new(("tab_fade", self.active_tab)),
+                        true,
+                        ANIM_TAB_SECS,
+                    );
+                    ui.set_opacity(a);
+                }
                 match self.active_tab {
                     ActiveTab::Dialpad => self.render_dialpad_tab(ui, &call_phase),
                     ActiveTab::Contacts => self.render_contacts_tab(ui),
@@ -1080,21 +1111,44 @@ impl RustSipApp {
 
                 ui.add_space(10.0);
 
-                // Sliders de ganho e volume
+                // Sliders de ganho e volume.
+                // A trilha usa widgets.inactive.bg_fill, que globalmente = BG_CARD (cor do
+                // próprio card) → trilha invisível. Escopo local: poço BG_INPUT (mais escuro)
+                // + trailing fill ACCENT_BLUE mostrando o nível.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Ganho Mic:").font(font(FS_LABEL)).color(TEXT_SECONDARY));
-                    if ui.add(egui::Slider::new(&mut self.config.audio.mic_gain, 0.2..=3.0).text("x")).changed() {
-                        self.audio.state.set_mic_gain(self.config.audio.mic_gain);
-                        self.config.save();
-                    }
+                    ui.scope(|ui| {
+                        let v = ui.visuals_mut();
+                        v.widgets.inactive.bg_fill = BG_INPUT;
+                        v.widgets.hovered.bg_fill = BG_INPUT;
+                        v.widgets.active.bg_fill = BG_INPUT;
+                        v.selection.bg_fill = ACCENT_BLUE;
+                        if ui
+                            .add(egui::Slider::new(&mut self.config.audio.mic_gain, 0.2..=3.0).text("x").trailing_fill(true))
+                            .changed()
+                        {
+                            self.audio.state.set_mic_gain(self.config.audio.mic_gain);
+                            self.config.save();
+                        }
+                    });
                 });
 
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Volume:").font(font(FS_LABEL)).color(TEXT_SECONDARY));
-                    if ui.add(egui::Slider::new(&mut self.config.audio.speaker_volume, 0.1..=2.5).text("x")).changed() {
-                        self.audio.state.set_speaker_volume(self.config.audio.speaker_volume);
-                        self.config.save();
-                    }
+                    ui.scope(|ui| {
+                        let v = ui.visuals_mut();
+                        v.widgets.inactive.bg_fill = BG_INPUT;
+                        v.widgets.hovered.bg_fill = BG_INPUT;
+                        v.widgets.active.bg_fill = BG_INPUT;
+                        v.selection.bg_fill = ACCENT_BLUE;
+                        if ui
+                            .add(egui::Slider::new(&mut self.config.audio.speaker_volume, 0.1..=2.5).text("x").trailing_fill(true))
+                            .changed()
+                        {
+                            self.audio.state.set_speaker_volume(self.config.audio.speaker_volume);
+                            self.config.save();
+                        }
+                    });
                 });
 
                 ui.add_space(10.0);
