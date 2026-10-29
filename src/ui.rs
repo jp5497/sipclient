@@ -314,26 +314,8 @@ impl RustSipApp {
                 RegistrationStatus::Failed(err) => (STATUS_RED, err.as_str(), false),
             };
 
-            // Ponto indicador de status
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.5, status_dot);
-
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("RustSIP").font(font_bold(FS_SUBHEAD)).color(TEXT_PRIMARY));
-                    status_chip(ui, self.config.account.transport.as_str(), ACCENT_BLUE);
-                });
-
-                let subtitle = if self.config.account.is_configured() {
-                    format!("{}@{} • {}", self.config.account.username, self.config.account.effective_domain(), status_label)
-                } else {
-                    "Configure sua conta SIP na aba Configurações".to_string()
-                };
-
-                ui.label(RichText::new(subtitle).font(font(FS_CAPTION)).color(TEXT_SECONDARY));
-            });
-
-            // Botão de Conectar / Desconectar
+            // Botão PRIMEIRO, ancorado à direita (reserva seu espaço antes do texto —
+            // senão o bloco de texto consome tudo e o botão é pintado por cima).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if is_online || matches!(reg_status, RegistrationStatus::Connecting) {
                     let btn = egui::Button::new(
@@ -365,6 +347,32 @@ impl RustSipApp {
                         });
                     }
                 }
+
+                // Texto à esquerda, no espaço RESTANTE (left_to_right). O subtítulo
+                // longo TRUNCA com reticências em vez de passar por baixo do botão.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Ponto indicador de status
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.5, status_dot);
+
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("RustSIP").font(font_bold(FS_SUBHEAD)).color(TEXT_PRIMARY));
+                            status_chip(ui, self.config.account.transport.as_str(), ACCENT_BLUE);
+                        });
+
+                        let subtitle = if self.config.account.is_configured() {
+                            format!("{}@{} • {}", self.config.account.username, self.config.account.effective_domain(), status_label)
+                        } else {
+                            "Configure sua conta SIP na aba Configurações".to_string()
+                        };
+
+                        ui.add(
+                            egui::Label::new(RichText::new(subtitle).font(font(FS_CAPTION)).color(TEXT_SECONDARY))
+                                .truncate(),
+                        );
+                    });
+                });
             });
         });
     }
@@ -558,17 +566,22 @@ impl RustSipApp {
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Reserva à direita = 2 botões de 28px + os gaps reais de item_spacing
-                    // (input→btn→btn = 2 gaps). Evita estourar quando ambos aparecem.
+                    // Os botões backspace/limpar só aparecem com o campo preenchido.
+                    // Reserva o espaço deles (2×28px + 2 gaps reais) SÓ nesse caso;
+                    // vazio, o campo usa a largura cheia e o hint cabe inteiro.
                     let sp = ui.spacing().item_spacing.x;
-                    let reserve = 28.0 * 2.0 + sp * 2.0;
+                    let reserve = if self.dial_input.is_empty() {
+                        0.0
+                    } else {
+                        28.0 * 2.0 + sp * 2.0
+                    };
                     let resp = ui.add_sized(
                         Vec2::new((ui.available_width() - reserve).max(0.0), 32.0),
                         egui::TextEdit::singleline(&mut self.dial_input)
                             .font(font_bold(FS_TITLE))
                             .text_color(TEXT_PRIMARY)
                             .frame(false)
-                            .hint_text(RichText::new("Digite o número ou ramal...").color(TEXT_MUTED)),
+                            .hint_text(RichText::new("Número ou ramal").color(TEXT_MUTED)),
                     );
 
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1123,27 +1136,13 @@ impl RustSipApp {
         ui.horizontal(|ui| {
             let filters = [
                 (LogFilter::All, "Todos"),
-                (LogFilter::Tx, "TX (Enviados)"),
-                (LogFilter::Rx, "RX (Recebidos)"),
+                (LogFilter::Tx, "TX"),
+                (LogFilter::Rx, "RX"),
                 (LogFilter::Errors, "Erros"),
             ];
 
-            for (f, lbl) in filters {
-                let is_sel = self.log_filter == f;
-                let btn = egui::Button::new(
-                    RichText::new(lbl)
-                        .font(font_bold(FS_CAPTION))
-                        .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
-                )
-                .fill(if is_sel { BG_ACTIVE } else { BG_CARD })
-                .stroke(Stroke::new(1.0_f32, if is_sel { BORDER_FOCUS } else { BORDER_SUBTLE }))
-                .corner_radius(CornerRadius::same(4));
-
-                if ui.add(btn).clicked() {
-                    self.log_filter = f;
-                }
-            }
-
+            // Ícones copiar/limpar PRIMEIRO, ancorados à direita (reservam seu espaço);
+            // os filtros fluem no restante à esquerda e não colidem com eles.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_tool_button(ui, Icon::Trash, 26.0, "Limpar logs", false, BORDER_SUBTLE).clicked() {
                     if let Ok(mut q) = self.sip.state.logs.lock() {
@@ -1159,6 +1158,24 @@ impl RustSipApp {
                     ctx.copy_text(full);
                     self.show_toast("Logs copiados.");
                 }
+
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    for (f, lbl) in filters {
+                        let is_sel = self.log_filter == f;
+                        let btn = egui::Button::new(
+                            RichText::new(lbl)
+                                .font(font_bold(FS_CAPTION))
+                                .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
+                        )
+                        .fill(if is_sel { BG_ACTIVE } else { BG_CARD })
+                        .stroke(Stroke::new(1.0_f32, if is_sel { BORDER_FOCUS } else { BORDER_SUBTLE }))
+                        .corner_radius(CornerRadius::same(4));
+
+                        if ui.add(btn).clicked() {
+                            self.log_filter = f;
+                        }
+                    }
+                });
             });
         });
 
@@ -1202,10 +1219,14 @@ impl RustSipApp {
                         let row_resp = ui.horizontal(|ui| {
                             status_chip(ui, entry.direction, badge_col);
                             ui.label(RichText::new(&entry.timestamp).font(font_mono(FS_MICRO)).color(TEXT_MUTED));
-                            ui.label(
-                                RichText::new(&entry.summary)
-                                    .font(font(FS_CAPTION))
-                                    .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
+                            // Summary longo TRUNCA com reticências — não empurra a largura da linha.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&entry.summary)
+                                        .font(font(FS_CAPTION))
+                                        .color(if is_sel { TEXT_PRIMARY } else { TEXT_SECONDARY }),
+                                )
+                                .truncate(),
                             );
                         }).response;
 
