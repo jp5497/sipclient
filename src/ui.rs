@@ -2,8 +2,8 @@ use crate::audio::{AudioDeviceInfo, AudioEngine, MODE_LOOPBACK_TEST};
 use crate::config::{AppConfig, CallDirection, CallHistoryEntry, Contact, TransportProtocol};
 use crate::sip::{CallPhase, RegistrationStatus, SipCommand, SipController};
 use crate::theme::{
-    self, action_button, call_control_button, card_frame, dial_key, font, font_bold, font_mono,
-    icon_tool_button, paint_icon, status_chip, tab_button, text_input, vu_meter, Icon,
+    self, action_button, call_control_button, card_frame, dial_key, elide, font, font_bold,
+    font_mono, icon_tool_button, paint_icon, status_chip, tab_button, text_input, vu_meter, Icon,
     ACCENT_BLUE, BG_ACTIVE, BG_APP, BG_CARD, BG_INPUT, BG_PANEL, BORDER_FOCUS, BORDER_SUBTLE,
     FS_BODY, FS_CAPTION, FS_HEADING, FS_LABEL, FS_MICRO, FS_SUBHEAD, FS_TITLE, SP1, SP2, SP5,
     STATUS_AMBER, STATUS_GREEN, STATUS_RED, STATUS_RED_FILL, TEXT_MUTED, TEXT_PRIMARY,
@@ -1013,9 +1013,13 @@ impl RustSipApp {
                     None => def_in.clone(),
                 };
 
+                // Largura com folga da borda do card; o texto fechado ELIDE (a seta
+                // do combo consome ~24px, por isso o -28 na largura de texto).
+                let combo_w = (ui.available_width() - SP1).max(0.0);
+                let cur_in = elide(ui, &cur_in, font(FS_BODY), combo_w - 28.0);
                 egui::ComboBox::from_id_salt("combo_in_dev")
                     .selected_text(RichText::new(cur_in).color(TEXT_PRIMARY))
-                    .width(ui.available_width())
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(self.config.audio.input_device.is_none(), &def_in).clicked() {
                             self.config.audio.input_device = None;
@@ -1053,9 +1057,11 @@ impl RustSipApp {
                     None => def_out.clone(),
                 };
 
+                let combo_w = (ui.available_width() - SP1).max(0.0);
+                let cur_out = elide(ui, &cur_out, font(FS_BODY), combo_w - 28.0);
                 egui::ComboBox::from_id_salt("combo_out_dev")
                     .selected_text(RichText::new(cur_out).color(TEXT_PRIMARY))
-                    .width(ui.available_width())
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(self.config.audio.output_device.is_none(), &def_out).clicked() {
                             self.config.audio.output_device = None;
@@ -1096,9 +1102,9 @@ impl RustSipApp {
                 // Teste de Loopback
                 let is_loopback = self.audio.state.mode.load(Ordering::Relaxed) == MODE_LOOPBACK_TEST;
                 let (test_txt, test_col) = if is_loopback {
-                    ("Parar Teste de Áudio", STATUS_RED_FILL)
+                    ("Parar teste de áudio", STATUS_RED_FILL)
                 } else {
-                    ("Iniciar Teste de Microfone / Alto-falante", ACCENT_BLUE)
+                    ("Testar áudio (loopback)", ACCENT_BLUE)
                 };
 
                 if action_button(ui, test_txt, Some(Icon::Speaker), test_col, ui.available_width(), 32.0).clicked() {

@@ -543,6 +543,36 @@ fn text_width(ui: &Ui, text: &str, font_id: FontId) -> f32 {
     ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, Color32::WHITE).size().x)
 }
 
+/// Encurta `s` com reticências até caber em `max_w` px na fonte `font_id`.
+/// Para texto fechado de ComboBox/label onde não há wrap nem truncate nativo.
+/// Respeita limites de char (UTF-8), não de byte.
+pub fn elide(ui: &Ui, s: &str, font_id: FontId, max_w: f32) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    if text_width(ui, s, font_id.clone()) <= max_w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    // Busca o maior prefixo que, com "…", ainda cabe.
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if text_width(ui, &candidate, font_id.clone()) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        "…".to_string()
+    } else {
+        chars[..lo].iter().collect::<String>() + "…"
+    }
+}
+
 /// Botão de ação primária preenchido (Ligar / Atender / Salvar...).
 pub fn action_button(
     ui: &mut Ui,
