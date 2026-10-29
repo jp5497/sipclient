@@ -109,10 +109,18 @@ async fn query_stun_rfc5389(
     // desistir. Sem retry, um único datagrama perdido (comum em NAT) faz a
     // descoberta cair no IP local -> áudio one-way. Teto total ~2.3s para não
     // travar a discagem (650 + 850 + 800ms de espera).
+    //
+    // CAVEAT (pendência conhecida): usamos um Transaction ID NOVO por tentativa.
+    // Se o RTT real do servidor STUN for > o timeout da tentativa (ex.: >650ms
+    // na 1ª), a resposta da tentativa anterior chega com um txid que já não
+    // casa e é descartada — perdemos essa resposta e dependemos da próxima
+    // tentativa. Um txid FIXO reaproveitaria respostas atrasadas; mantemos o
+    // txid-por-tentativa (mais simples e evita aceitar respostas obsoletas),
+    // aceitando o trade-off em redes de RTT alto.
     const ATTEMPT_TIMEOUTS_MS: [u64; 3] = [650, 850, 800];
 
     let mut buf = [0u8; 512];
-    for (attempt, &timeout_ms) in ATTEMPT_TIMEOUTS_MS.iter().enumerate() {
+    for &timeout_ms in ATTEMPT_TIMEOUTS_MS.iter() {
         // Transaction ID NOVO por tentativa (uma resposta atrasada da tentativa
         // anterior não deve ser aceita como resposta desta).
         let mut req = [0u8; 20];
@@ -160,7 +168,6 @@ async fn query_stun_rfc5389(
             // Resposta válida mas sem endereço mapeável: não adianta reenviar.
             return Ok(None);
         }
-        let _ = attempt; // documenta intenção; backoff é o próprio timeout crescente
     }
 
     Ok(None)

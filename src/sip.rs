@@ -593,6 +593,11 @@ struct ActiveCallDialog {
     last_invite_uri: String,
     last_invite_auth_line: String,
     last_invite_raw: String,
+    /// CSeq da ÚLTIMA requisição INVITE cliente enviada. Separado de `cseq`
+    /// porque send_bye/send_sip_info_dtmf INCREMENTAM `cseq` — usar `cseq` na
+    /// guarda de resposta do INVITE faria um 200 OK RETRANSMITIDO (após um BYE
+    /// ou DTMF ter mexido em cseq) ser ignorado, e o ACK não seria reenviado.
+    invite_cseq: u32,
     is_incoming: bool,
     incoming_invite_via: Vec<String>,
     incoming_invite_cseq: String,
@@ -660,14 +665,15 @@ impl TxTable {
         })
     }
 
-    /// Reenvia as transações vencidas; descarta (com log) as que estouraram o
-    /// teto total. Retorna o próximo instante em que algo precisa disparar.
+    /// Reenvia as transações vencidas; remove as que estouraram o teto total e
+    /// RETORNA a lista (método, cseq) das expiradas para o chamador atualizar a
+    /// UI (uma transação abandonada não pode deixar a UI presa em "Chamando…").
     fn tick(
         &mut self,
         now: Instant,
         out_tx: &mpsc::UnboundedSender<String>,
         state: &Arc<SipSharedState>,
-    ) {
+    ) -> Vec<(String, u32)> {
         let mut expired = Vec::new();
         for (txn, created) in self.txns.iter_mut() {
             if now.duration_since(*created) >= TXN_TOTAL_TIMEOUT {
@@ -690,7 +696,7 @@ impl TxTable {
             self.txns.retain(|(_t, created)| {
                 now.duration_since(*created) < TXN_TOTAL_TIMEOUT
             });
-            for (method, cseq) in expired {
+            for (method, cseq) in &expired {
                 state.add_log(
                     "ERR",
                     format!(
@@ -703,6 +709,14 @@ impl TxTable {
                 );
             }
         }
+        expired
+    }
+
+    /// Remove todas as transações de um método (ex.: limpar o INVITE pendente
+    /// ao desligar, para não retransmitir por 8s depois do Hangup/CANCEL).
+    fn clear_method(&mut self, method: &str) {
+        self.txns
+            .retain(|(t, _)| !t.method.eq_ignore_ascii_case(method));
     }
 }
 
@@ -723,7 +737,11 @@ fn top_via_branch(msg: &SipMessage) -> String {
     let Some(via) = msg.header("Via") else {
         return String::new();
     };
-    for part in via.split(';') {
+    // Um header Via pode conter várias vias separadas por vírgula; o branch que
+    // nos interessa é o do TOPO (a primeira). Corta em ',' antes de dividir os
+    // parâmetros por ';' para não pegar o branch de uma via subsequente.
+    let top = via.split(',').next().unwrap_or(via);
+    for part in top.split(';') {
         let p = part.trim();
         if let Some(b) = p.strip_prefix("branch=") {
             return b.trim().to_string();
@@ -984,7 +1002,32 @@ async fn run_active_session(
     loop {
         tokio::select! {
             _ = retransmit_timer.tick(), if is_udp => {
-                tx_table.tick(Instant::now(), &out_tx, state);
+                let expired = tx_table.tick(Instant::now(), &out_tx, state);
+                for (method, _cseq) in expired {
+                    if method.eq_ignore_ascii_case("INVITE") {
+                        // INVITE cliente sem resposta: não deixa a UI presa em
+                        // "Chamando…". Encerra a chamada e registra como perdida.
+                        if let Some(ref dialog) = active_call {
+                            if let Some(ref h) = dialog.rtp_handle {
+                                h.stop();
+                            }
+                            record_completed_call(state, dialog);
+                        }
+                        audio.stop_audio();
+                        state.set_call_phase(CallPhase::Idle);
+                        active_call = None;
+                        state.add_log(
+                            "ERR",
+                            "INVITE sem resposta do servidor — chamada encerrada",
+                            "",
+                        );
+                    } else if method.eq_ignore_ascii_case("REGISTER") {
+                        state.set_reg_status(RegistrationStatus::Failed(
+                            "Sem resposta do servidor".to_string(),
+                        ));
+                    }
+                    // BYE expirado: a chamada já foi encerrada localmente; nada a fazer.
+                }
             }
             Some(reason) = link_down_rx.recv() => {
                 // Transporte caiu: limpa o estado "Registrado" fantasma e
@@ -1010,7 +1053,7 @@ async fn run_active_session(
             _ = re_reg_timer.tick() => {
                 reg_cseq += 1;
                 reg_auth_attempts = 0;
-                send_register(
+                let (rb, rr) = send_register(
                     &account,
                     &domain,
                     &contact_ip,
@@ -1024,6 +1067,9 @@ async fn run_active_session(
                     &out_tx,
                     state,
                 );
+                if is_udp {
+                    tx_table.register(make_txn("REGISTER", reg_cseq, &rb, &rr));
+                }
             }
             _ = keepalive_timer.tick() => {
                 // Keep-alive CRLF RFC 5626 para manter NAT aberto no roteador e FreeSWITCH
@@ -1068,6 +1114,14 @@ async fn run_active_session(
                     }
 
                     if cseq_method.eq_ignore_ascii_case("REGISTER") {
+                        // Guarda de CSeq: ignora resposta de uma transação
+                        // REGISTER ANTIGA (ex.: 401 duplicado que o servidor
+                        // reenvia por cada retransmissão nossa). Sem isto, um
+                        // 401 da txn vencida gravaria Failed("senha recusada")
+                        // ERRADO estando já registrado.
+                        if cseq_num(&msg) != Some(reg_cseq) {
+                            continue;
+                        }
                         match status {
                             200 => {
                                 reg_auth_attempts = 0;
@@ -1160,7 +1214,7 @@ async fn run_active_session(
                             // diferentes e deve ser IGNORADA, não aplicada ao diálogo.
                             let resp_cseq = cseq_num(&msg);
                             let resp_branch = top_via_branch(&msg);
-                            let cseq_ok = resp_cseq == Some(dialog.cseq);
+                            let cseq_ok = resp_cseq == Some(dialog.invite_cseq);
                             let branch_ok = dialog.last_invite_branch.is_empty()
                                 || resp_branch.is_empty()
                                 || resp_branch == dialog.last_invite_branch;
@@ -1297,6 +1351,20 @@ async fn run_active_session(
                                         }
                                     }
                                     200 => {
+                                        // 2xx RETRANSMITIDO de uma chamada JÁ
+                                        // conectada (nosso ACK se perdeu): apenas
+                                        // REENVIA o ACK. NÃO reexecuta o handler
+                                        // — isso reiniciaria connected_at/áudio.
+                                        if dialog.connected_at.is_some() {
+                                            send_2xx_ack(
+                                                &account,
+                                                &contact_ip,
+                                                contact_port,
+                                                dialog,
+                                                &out_tx,
+                                                state,
+                                            );
+                                        } else {
                                         // Captura Contact e Record-Route do 200 OK
                                         if let Some(contact_hdr) = msg.header("Contact") {
                                             dialog.remote_target_uri = extract_uri_from_header(contact_hdr);
@@ -1359,6 +1427,7 @@ async fn run_active_session(
                                             codec_name: codec_used.name().to_string(),
                                             connected_at: now,
                                         });
+                                        }
                                     }
                                     code if code >= 300 => {
                                         send_non_2xx_ack(
@@ -1487,6 +1556,7 @@ async fn run_active_session(
                                 last_invite_uri: String::new(),
                                 last_invite_auth_line: String::new(),
                                 last_invite_raw: String::new(),
+                                invite_cseq: 1,
                                 is_incoming: true,
                                 incoming_invite_via: vias,
                                 incoming_invite_cseq: cseq_hdr,
@@ -1663,6 +1733,7 @@ async fn run_active_session(
                             last_invite_uri: remote_uri,
                             last_invite_auth_line: String::new(),
                             last_invite_raw: String::new(),
+                            invite_cseq: 1,
                             is_incoming: false,
                             incoming_invite_via: Vec::new(),
                             incoming_invite_cseq: String::new(),
@@ -1829,6 +1900,10 @@ async fn run_active_session(
                                 );
                             }
                             record_completed_call(state, dialog);
+                        }
+                        // Para de retransmitir o INVITE pendente (desligamos).
+                        if is_udp {
+                            tx_table.clear_method("INVITE");
                         }
                         audio.stop_audio();
                         state.set_call_phase(CallPhase::Idle);
@@ -2060,6 +2135,7 @@ fn send_invite(
     state.add_log("TX", format!("INVITE {} (CSeq {})", uri, dialog.cseq), &msg);
     let _ = out_tx.send(msg.clone());
     dialog.last_invite_raw = msg.clone();
+    dialog.invite_cseq = dialog.cseq;
     msg
 }
 
@@ -2089,7 +2165,7 @@ fn send_non_2xx_ack(
         from = dialog.from_header,
         to = response_to_header,
         call_id = dialog.call_id,
-        cseq = dialog.cseq,
+        cseq = dialog.invite_cseq,
     );
 
     state.add_log("TX", format!("ACK {}", uri), &msg);
@@ -2128,7 +2204,7 @@ fn send_2xx_ack(
         from = dialog.from_header,
         to = dialog.to_header,
         call_id = dialog.call_id,
-        cseq = dialog.cseq,
+        cseq = dialog.invite_cseq,
         auth_line = dialog.last_invite_auth_line,
     );
 

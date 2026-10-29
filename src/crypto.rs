@@ -210,19 +210,25 @@ pub fn decrypt_password(stored: &str, anchor_path: &std::path::Path) -> DecryptR
         return DecryptResult::Legacy(stored.to_string());
     };
 
+    // GOTCHA: uma senha legada em texto plano pode começar com "v1:" por
+    // coincidência. Só tratamos como container cifrado se a ESTRUTURA casar
+    // nonce:ct:tag com hex válido e tamanhos corretos; caso contrário é Legacy
+    // (texto plano), nunca Failed — tratar como Failed apagaria a senha.
     let parts: Vec<&str> = rest.split(':').collect();
     if parts.len() != 3 {
-        return DecryptResult::Failed;
+        return DecryptResult::Legacy(stored.to_string());
     }
     let (Some(nonce), Some(ct), Some(tag)) =
         (hex_decode(parts[0]), hex_decode(parts[1]), hex_decode(parts[2]))
     else {
-        return DecryptResult::Failed;
+        return DecryptResult::Legacy(stored.to_string());
     };
     if nonce.len() != NONCE_LEN || tag.len() != MD5_OUT {
-        return DecryptResult::Failed;
+        return DecryptResult::Legacy(stored.to_string());
     }
 
+    // A partir daqui é um container v1 bem-formado: uma falha de MAC significa
+    // chave errada/adulteração => Failed (NÃO Legacy, para não vazar o cru).
     let key = derive_key(anchor_path);
     let k_mac = hmac_md5(&key, b"rustsip-mac-v1");
 
@@ -306,16 +312,24 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_hex_fails_tolerant() {
+    fn test_malformed_v1_prefix_is_legacy_not_failed() {
+        // GOTCHA: senha legada em texto plano que por acaso começa com "v1:"
+        // (ou qualquer "v1:..." sem a estrutura nonce:ct:tag hex válida) deve
+        // ser Legacy, NUNCA Failed — tratar como Failed apagaria a senha real.
         let anchor = anchor();
         assert!(matches!(
             decrypt_password("v1:zz:zz:zz", anchor),
-            DecryptResult::Failed
+            DecryptResult::Legacy(_)
         ));
         assert!(matches!(
             decrypt_password("v1:deadbeef", anchor),
-            DecryptResult::Failed
+            DecryptResult::Legacy(_)
         ));
+        // "v1:minhasenha" (um usuário cuja senha literal é isso) -> Legacy.
+        match decrypt_password("v1:minhasenha", anchor) {
+            DecryptResult::Legacy(p) => assert_eq!(p, "v1:minhasenha"),
+            _ => panic!("v1: coincidente deve ser Legacy com o valor íntegro"),
+        }
     }
 
     #[test]

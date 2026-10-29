@@ -164,6 +164,13 @@ pub struct AppConfig {
     /// vazia nesse caso, mas o RESTO da config é preservado.
     #[serde(skip)]
     pub password_needs_reentry: bool,
+    /// Valor CRU do campo password como veio do disco (cifrado ou legado). NÃO
+    /// persistido. Serve de salvaguarda: se a decifragem falhou (transitória —
+    /// /etc/machine-id ilegível, HOME/uid diferente), um save() subsequente com
+    /// senha vazia regrava ESTE valor em vez de "" — assim não apaga o
+    /// ciphertext recuperável de forma definitiva.
+    #[serde(skip)]
+    pub stored_password_raw: String,
 }
 
 impl AppConfig {
@@ -208,25 +215,55 @@ impl AppConfig {
             return Self::default();
         };
 
+        // Guarda o valor CRU do disco ANTES de decifrar (salvaguarda #1).
+        cfg.stored_password_raw = cfg.account.password.clone();
+
         // Decifragem TOLERANTE e ISOLADA NO CAMPO password.
+        let mut migrate_legacy = false;
         match crate::crypto::decrypt_password(&cfg.account.password, &dir) {
             crate::crypto::DecryptResult::Ok(pw) => {
                 cfg.account.password = pw;
                 cfg.password_needs_reentry = false;
             }
             crate::crypto::DecryptResult::Legacy(pw) => {
-                // Texto plano legado: carrega e será re-cifrado no próximo save.
+                // Texto plano legado: carrega e re-cifra+0600 já no load (M2),
+                // para não ficar legível por outros até o 1º save do usuário.
                 cfg.account.password = pw;
                 cfg.password_needs_reentry = false;
+                migrate_legacy = !cfg.account.password.is_empty();
             }
             crate::crypto::DecryptResult::Failed => {
-                // Não apaga a config: zera só a senha e sinaliza reentrada.
+                // Não apaga a config: zera só a senha e sinaliza reentrada. O
+                // ciphertext cru fica em stored_password_raw para o save()
+                // preservá-lo em vez de gravar "".
                 cfg.account.password = String::new();
                 cfg.password_needs_reentry = true;
             }
         }
 
+        if migrate_legacy {
+            // Re-cifra o legado imediatamente (grava com 0600 via write_atomic).
+            cfg.save();
+        }
+
         cfg
+    }
+
+    /// Decide o valor do campo `password` a GRAVAR em disco, sem tocar `self`.
+    /// Regras (salvaguarda #1):
+    /// - reentrada pendente + senha vazia em memória => regrava o cru do disco
+    ///   INALTERADO (não apaga o ciphertext recuperável numa falha transitória);
+    /// - senha não-vazia => re-cifra com nonce novo;
+    /// - senha vazia sem flag => grava "" (conta sem senha, intencional).
+    pub fn persisted_password_field(&self, dir: &std::path::Path) -> String {
+        if self.password_needs_reentry && self.account.password.is_empty() {
+            self.stored_password_raw.clone()
+        } else if !self.account.password.is_empty() {
+            let nonce = crate::crypto::random_nonce();
+            crate::crypto::encrypt_password(&self.account.password, dir, nonce)
+        } else {
+            String::new()
+        }
     }
 
     pub fn save(&self) {
@@ -234,14 +271,9 @@ impl AppConfig {
         let dir = Self::config_dir();
 
         // Cifra a senha SÓ na forma persistida; a cópia em memória (self) fica
-        // intacta em claro para o Digest. Serializa uma cópia com a senha
-        // cifrada. Senha vazia é gravada como "" (sem cifrar nada).
+        // intacta em claro para o Digest.
         let mut to_persist = self.clone();
-        if !to_persist.account.password.is_empty() {
-            let nonce = crate::crypto::random_nonce();
-            to_persist.account.password =
-                crate::crypto::encrypt_password(&self.account.password, &dir, nonce);
-        }
+        to_persist.account.password = self.persisted_password_field(&dir);
 
         let json = match serde_json::to_string_pretty(&to_persist) {
             Ok(j) => j,
@@ -300,5 +332,54 @@ impl AppConfig {
         }
         fs::rename(&tmp, path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn anchor() -> &'static Path {
+        Path::new("/tmp")
+    }
+
+    /// BLOQUEADOR #1: decifragem falhou (password_needs_reentry) e o usuário
+    /// não digitou senha nova => um save() NÃO pode sobrescrever o ciphertext
+    /// recuperável com "". O campo persistido deve ser IDÊNTICO ao cru do disco.
+    #[test]
+    fn test_failed_decrypt_save_preserves_ciphertext() {
+        let raw_from_disk =
+            "v1:0123456789abcdef0123456789abcdef:deadbeef:00112233445566778899aabbccddeeff"
+                .to_string();
+        let mut cfg = AppConfig::default();
+        cfg.stored_password_raw = raw_from_disk.clone();
+        cfg.account.password = String::new(); // zerada no load por falha
+        cfg.password_needs_reentry = true;
+
+        let persisted = cfg.persisted_password_field(anchor());
+        assert_eq!(
+            persisted, raw_from_disk,
+            "save em estado de reentrada deve regravar o cru INALTERADO, não \"\""
+        );
+    }
+
+    /// Senha nova não-vazia re-cifra (vira container v1 novo) e NÃO contém a
+    /// senha em claro.
+    #[test]
+    fn test_new_password_reencrypts() {
+        let mut cfg = AppConfig::default();
+        cfg.account.password = "SenhaNova123".to_string();
+        cfg.password_needs_reentry = false;
+        let persisted = cfg.persisted_password_field(anchor());
+        assert!(persisted.starts_with("v1:"));
+        assert!(!persisted.contains("SenhaNova123"));
+    }
+
+    /// Conta deliberadamente sem senha (vazia, sem flag) grava "".
+    #[test]
+    fn test_empty_password_no_flag_writes_empty() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.persisted_password_field(anchor()), "");
     }
 }
