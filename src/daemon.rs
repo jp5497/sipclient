@@ -11,7 +11,7 @@
 //! ora só loga a intenção; o encerramento ("Sair", SIGTERM/SIGINT) é gracioso:
 //! derruba a chamada ativa, faz un-REGISTER com timeout e para o áudio.
 
-use crate::audio::{AudioEngine, AudioSharedState};
+use crate::audio::{AudioEngine, AudioSharedState, MODE_LOOPBACK_TEST};
 use crate::config::AppConfig;
 use crate::ipc::{
     self, CallPhaseWire, ClientMsg, FlagsWire, ServerMsg, SipLogEntryWire, MAX_FRAME_BYTES,
@@ -342,15 +342,26 @@ async fn run_inner() -> Result<()> {
         }
     };
 
-    // --- Servidor IPC (F1): expõe o estado por socket Unix para a janela ---
+    // --- Servidor IPC: expõe o estado por socket Unix e, na F2, APLICA os
+    // comandos da janela (Connect/Dial/.../SaveAccount). O daemon é o dono do
+    // núcleo SIP/áudio e o ÚNICO writer do config. ---
     // Remove socket órfão antes do bind; o diretório 0700 já existe (runtime_dir
     // foi criado em run()). O servidor roda como task tokio neste mesmo runtime.
     let rt_dir = runtime_dir()?;
     let sock_path = rt_dir.join("daemon.sock");
+    // Canal de BROADCAST para frames de SEÇÃO (AudioCfg/Contacts/History/
+    // Account) quando um comando muda o config: todos os clientes conectados
+    // recebem. Capacidade modesta — um cliente muito atrasado perde frames de
+    // config (Lagged), que o Welcome/próxima mudança reconcilia. NÃO vai o
+    // AppConfig inteiro, só a seção afetada (senão sobrescreve formulário aberto).
+    let (cfg_tx, _cfg_rx0) = tokio::sync::broadcast::channel::<ServerMsg>(64);
     let ipc_server = IpcServer {
+        sip: sip.clone(),
+        audio: audio.clone(),
         sip_state: state.clone(),
         audio_state: audio.state.clone(),
         config: config.clone(),
+        cfg_tx: cfg_tx.clone(),
         tray_available,
         daemon_pid: std::process::id(),
     };
@@ -551,11 +562,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// explícita para robustez se o tick mudar.
 const HOT_MIN_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Estado compartilhado que o servidor IPC lê para montar snapshots e deltas.
+/// Estado compartilhado que o servidor IPC lê para montar snapshots e deltas,
+/// e os handles que ele usa para APLICAR os comandos da F2 (SipController para
+/// Connect/Dial/..., AudioEngine para gain/volume/device/loopback, config para
+/// persistir). `cfg_tx` faz broadcast dos frames de seção (AudioCfg/Contacts/
+/// History/Account) a TODOS os clientes quando um comando muda o config.
 struct IpcServer {
+    sip: SipController,
+    audio: AudioEngine,
     sip_state: Arc<SipSharedState>,
     audio_state: Arc<AudioSharedState>,
     config: Arc<Mutex<AppConfig>>,
+    cfg_tx: tokio::sync::broadcast::Sender<ServerMsg>,
     tray_available: bool,
     daemon_pid: u32,
 }
@@ -651,6 +669,15 @@ impl IpcServer {
                 (exe_mtime,)
             }
             None => return Ok(()), // EOF antes do Hello
+            // Um comando antes do Hello viola a ordem do protocolo: o daemon
+            // ainda não enviou o Welcome. Encerra a conexão sem aplicar nada.
+            Some(_) => {
+                println!(
+                    "[{}] [daemon] IPC: comando antes do Hello; desconectando",
+                    ts()
+                );
+                return Ok(());
+            }
         };
 
         // 2) Monta e envia o Welcome (snapshot). stale_exe: compara o mtime do
@@ -707,10 +734,30 @@ impl IpcServer {
         };
         let pub_handle = tokio::spawn(publisher.run());
 
-        // 5) Entrega os deltas ao socket. Também drena o read half para detectar
-        //    EOF/erros do cliente (na F1 não há mais ClientMsg, mas um frame
-        //    inesperado > teto desconecta).
-        let mut drain_buf = [0u8; 256];
+        // 5) Duas tarefas concorrentes nesta conexão:
+        //    (a) READER: possui `reader` e faz loop de `read_client_frame` para
+        //        aplicar os comandos ClientMsg (F2). Fica em TASK PRÓPRIA porque
+        //        `read_until` NÃO é cancel-safe: num `select!` que o cancelasse
+        //        no meio de uma linha, o buffer parcial se perderia e o próximo
+        //        frame viria corrompido. Isolado numa task, o read nunca é
+        //        cancelado. Sinaliza o fim (EOF/erro) por um oneshot.
+        //    (b) WRITER (este loop): multiplexa os deltas do Publisher (`rx`) e
+        //        os frames de seção por broadcast (`cfg_rx`), e encerra quando o
+        //        reader sinaliza que o cliente fechou.
+        let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel::<()>();
+        let reader_server = self.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut reader = reader;
+            // Ok(Some)=comando; Ok(None)=EOF limpo; Err=frame inválido/grande.
+            // Os dois últimos encerram o loop (e a conexão).
+            while let Ok(Some(msg)) = read_client_frame(&mut reader).await {
+                // NUNCA logar o frame (SaveAccount carrega senha).
+                reader_server.apply_command(msg);
+            }
+            let _ = eof_tx.send(());
+        });
+
+        let mut cfg_rx = self.cfg_tx.subscribe();
         let res: Result<()> = loop {
             tokio::select! {
                 maybe = rx.recv() => {
@@ -723,17 +770,219 @@ impl IpcServer {
                         None => break Ok(()), // Publisher encerrou
                     }
                 }
-                r = reader.read(&mut drain_buf) => {
-                    match r {
-                        Ok(0) => break Ok(()),       // cliente fechou
-                        Ok(_) => { /* F1: ignora bytes do cliente */ }
-                        Err(e) => break Err(e.into()),
+                bcast = cfg_rx.recv() => {
+                    match bcast {
+                        Ok(msg) => {
+                            if let Err(e) = ipc::write_frame_async(&mut write_half, &msg).await {
+                                break Err(e);
+                            }
+                        }
+                        // Cliente atrasado perdeu N frames de config; o próximo
+                        // frame de seção (ou um novo Welcome ao reconectar)
+                        // reconcilia. Não derruba a conexão por isto.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // O daemon está encerrando (cfg_tx caiu). Segue
+                            // servindo os deltas até o cliente/Publisher fechar.
+                        }
                     }
+                }
+                _ = &mut eof_rx => {
+                    // O reader detectou EOF/erro do cliente: encerra a conexão.
+                    break Ok(());
                 }
             }
         };
         pub_handle.abort();
+        reader_handle.abort();
         res
+    }
+
+    /// Aplica um ClientMsg de COMANDO (F2) no núcleo do daemon. O `Hello` tardio
+    /// é ignorado (o handshake já ocorreu). Cada comando que muda o config grava
+    /// (o daemon é o único writer) e faz broadcast do frame de SEÇÃO afetado via
+    /// `cfg_tx` — não o AppConfig inteiro, para não sobrescrever um formulário
+    /// aberto em outro cliente.
+    fn apply_command(&self, msg: ClientMsg) {
+        match msg {
+            // Handshake repetido: no-op (não há renegociação).
+            ClientMsg::Hello { .. } => {}
+
+            // --- Sessão ---
+            ClientMsg::Connect => {
+                let (account, input_dev, output_dev) = {
+                    let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        cfg.account.clone(),
+                        cfg.audio.input_device.clone(),
+                        cfg.audio.output_device.clone(),
+                    )
+                };
+                if account.is_configured() {
+                    self.sip.send(SipCommand::Connect {
+                        account,
+                        input_dev,
+                        output_dev,
+                    });
+                }
+            }
+            ClientMsg::Disconnect => self.sip.send(SipCommand::Disconnect),
+            ClientMsg::Dial { target } => {
+                let target = target.trim().to_string();
+                if target.is_empty() {
+                    return;
+                }
+                let (input_dev, output_dev) = self.audio_devices();
+                // Se um teste de loopback estava rodando, encerra antes de discar
+                // (mesma política da UI local antiga em trigger_dial).
+                if self.audio.state.mode.load(Ordering::Relaxed) == MODE_LOOPBACK_TEST {
+                    self.audio.stop_audio();
+                }
+                self.sip.send(SipCommand::Dial {
+                    target,
+                    input_dev,
+                    output_dev,
+                });
+            }
+            ClientMsg::Answer => {
+                let (input_dev, output_dev) = self.audio_devices();
+                self.sip.send(SipCommand::Answer { input_dev, output_dev });
+            }
+            ClientMsg::Hangup => self.sip.send(SipCommand::Hangup),
+            ClientMsg::KeypadDigit(d) => {
+                // Tom DTMF local no daemon + DTMF SIP se em chamada.
+                let (_in, out) = self.audio_devices();
+                self.audio.play_keypad_dtmf(d, out);
+                let in_call = matches!(
+                    self.sip_state.call_phase.lock().map(|p| p.clone()),
+                    Ok(CallPhase::InCall { .. })
+                );
+                if in_call {
+                    self.sip.send(SipCommand::SendDtmf(d));
+                }
+            }
+
+            // --- Flags de áudio (refletem via Publisher::Flags) ---
+            ClientMsg::SetMuted(v) => self.audio.state.muted.store(v, Ordering::Relaxed),
+            ClientMsg::SetHold(v) => self.audio.state.on_hold.store(v, Ordering::Relaxed),
+
+            // --- Ajustes de áudio: aplica + grava + emite AudioCfg ---
+            ClientMsg::SetMicGain(g) => {
+                self.audio.state.set_mic_gain(g);
+                self.mutate_config(|c| c.audio.mic_gain = g);
+                self.broadcast_audio_cfg();
+            }
+            ClientMsg::SetSpeakerVolume(v) => {
+                self.audio.state.set_speaker_volume(v);
+                self.mutate_config(|c| c.audio.speaker_volume = v);
+                self.broadcast_audio_cfg();
+            }
+            ClientMsg::SetInputDevice(dev) => {
+                self.mutate_config(|c| c.audio.input_device = dev.clone());
+                let out = self.audio_devices().1;
+                self.audio.reload_devices_if_active(dev, out);
+                self.broadcast_audio_cfg();
+            }
+            ClientMsg::SetOutputDevice(dev) => {
+                self.mutate_config(|c| c.audio.output_device = dev.clone());
+                let inp = self.audio_devices().0;
+                self.audio.reload_devices_if_active(inp, dev);
+                self.broadcast_audio_cfg();
+            }
+
+            // --- Teste de áudio (real, só no daemon) ---
+            ClientMsg::StartLoopbackTest => {
+                let (inp, out) = self.audio_devices();
+                self.audio.start_loopback_test(inp, out);
+            }
+            ClientMsg::StopLoopbackTest => self.audio.stop_audio(),
+
+            // --- Config persistido ---
+            ClientMsg::SaveAccount { account, reconnect } => {
+                let do_connect = reconnect && account.is_configured();
+                let (input_dev, output_dev) = self.audio_devices();
+                self.mutate_config(|c| c.account = account.clone());
+                // Emite a conta de volta (o cliente aplica o formulário só aqui).
+                let _ = self.cfg_tx.send(ServerMsg::Account(account.clone()));
+                if do_connect {
+                    self.sip.send(SipCommand::Connect {
+                        account,
+                        input_dev,
+                        output_dev,
+                    });
+                }
+            }
+            ClientMsg::AddContact { name, number, notes } => {
+                let name = name.trim().to_string();
+                let number = number.trim().to_string();
+                if name.is_empty() || number.is_empty() {
+                    return;
+                }
+                let notes = notes.trim().to_string();
+                let id = format!("{}", chrono::Local::now().timestamp_millis());
+                self.mutate_config(|c| {
+                    c.contacts.push(crate::config::Contact { id: id.clone(), name: name.clone(), number: number.clone(), notes: notes.clone() });
+                });
+                self.broadcast_contacts();
+            }
+            ClientMsg::DeleteContact(id) => {
+                let mut removed = false;
+                self.mutate_config(|c| {
+                    let before = c.contacts.len();
+                    c.contacts.retain(|ct| ct.id != id);
+                    removed = c.contacts.len() != before;
+                });
+                if removed {
+                    self.broadcast_contacts();
+                }
+            }
+            ClientMsg::ClearHistory => {
+                self.mutate_config(|c| c.history.clear());
+                self.broadcast_history();
+            }
+        }
+    }
+
+    /// Dispositivos de áudio atuais do config (input, output).
+    fn audio_devices(&self) -> (Option<String>, Option<String>) {
+        let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+        (cfg.audio.input_device.clone(), cfg.audio.output_device.clone())
+    }
+
+    /// Muta o config sob lock E persiste (o daemon é o único writer). O save é
+    /// feito com o lock ainda SEGURO para serializar o estado consistente.
+    fn mutate_config(&self, f: impl FnOnce(&mut AppConfig)) {
+        let mut cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut cfg);
+        cfg.save();
+    }
+
+    /// Broadcast do frame de seção de ÁUDIO (gain/volume/device) a todos os
+    /// clientes. Snapshot do config sob lock, solto antes do send.
+    fn broadcast_audio_cfg(&self) {
+        let audio = {
+            let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+            cfg.audio.clone()
+        };
+        let _ = self.cfg_tx.send(ServerMsg::AudioCfg(audio));
+    }
+
+    /// Broadcast da lista de contatos a todos os clientes.
+    fn broadcast_contacts(&self) {
+        let contacts = {
+            let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+            cfg.contacts.clone()
+        };
+        let _ = self.cfg_tx.send(ServerMsg::Contacts(contacts));
+    }
+
+    /// Broadcast do histórico a todos os clientes.
+    fn broadcast_history(&self) {
+        let history = {
+            let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+            cfg.history.clone()
+        };
+        let _ = self.cfg_tx.send(ServerMsg::History(history));
     }
 
     /// Lê o seq atual e um backlog das últimas entradas de log (clonadas),

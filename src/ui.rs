@@ -1,6 +1,7 @@
 use crate::audio::{AudioDeviceInfo, AudioEngine, MODE_LOOPBACK_TEST};
 use crate::config::{AppConfig, CallDirection, CallHistoryEntry, Contact, TransportProtocol};
-use crate::sip::{CallPhase, RegistrationStatus, SipCommand, SipController};
+use crate::ipc::ClientMsg;
+use crate::sip::{CallPhase, RegistrationStatus, SipController};
 use crate::theme::{
     self, action_button, call_control_button, card_frame, dial_key, elide, font, font_bold,
     font_mono, icon_tool_button, paint_icon, status_chip, tab_button, text_input, vu_meter, Icon,
@@ -9,7 +10,6 @@ use crate::theme::{
     STATUS_AMBER, STATUS_GREEN, STATUS_RED, STATUS_RED_FILL, TEXT_MUTED, TEXT_PRIMARY,
     TEXT_SECONDARY,
 };
-use chrono::Local;
 use eframe::egui::{self, CornerRadius, RichText, Sense, Stroke, UiBuilder, Vec2};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -94,90 +94,38 @@ pub struct RustSipApp {
     tab_anim_start: Instant,
     tab_from_right: bool, // true = aba nova entra da direita (avançou)
 
-    // F1 (--remote): quando presente, a janela é um CLIENTE do daemon. O config
-    // (contatos/histórico/conta) vive neste espelho Arc<Mutex<>> que a thread de
-    // IPC atualiza; o update() copia dele por frame. None = janela local normal.
-    remote_config: Option<crate::remote::RemoteConfig>,
+    // F2: a janela é SEMPRE um CLIENTE do daemon. O config (conta/contatos/
+    // histórico/áudio) vive no espelho `remote_config` que a thread de IPC
+    // atualiza; o update() copia dele por frame. As AÇÕES da UI não tocam mais
+    // SipController/AudioEngine/config locais — enviam um ClientMsg via `client`.
+    remote_config: crate::remote::RemoteConfig,
+    client: crate::remote::DaemonClient,
+
+    // L6: a conta e o áudio são FORMULÁRIO (o usuário digita/arrasta em
+    // `self.config.account`/`self.config.audio`). Copiar o espelho inteiro a
+    // cada tick apagaria o que ele está digitando. Então só puxamos conta/áudio
+    // do espelho quando o DAEMON os muda (frame Account/AudioCfg): guardamos o
+    // último valor visto do espelho e, quando ele difere, copiamos uma vez.
+    // Contatos/histórico (listas de exibição, não editadas in-place) são
+    // copiados sempre.
+    prev_mirror_account: crate::config::SipAccountConfig,
+    prev_mirror_audio: crate::config::AudioConfig,
 }
 
 impl RustSipApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::configure_style(&cc.egui_ctx);
-
-        let mut config = AppConfig::load();
-        let audio = AudioEngine::new();
-        audio.state.set_mic_gain(config.audio.mic_gain);
-        audio.state.set_speaker_volume(config.audio.speaker_volume);
-
-        let sip = SipController::new(audio.clone());
-
-        let input_devices = AudioEngine::list_input_devices();
-        let output_devices = AudioEngine::list_output_devices();
-
-        if let Some(ref saved_in) = config.audio.input_device {
-            if !input_devices.iter().any(|d| &d.id == saved_in) {
-                config.audio.input_device = None;
-                config.save();
-            }
-        }
-        if let Some(ref saved_out) = config.audio.output_device {
-            if !output_devices.iter().any(|d| &d.id == saved_out) {
-                config.audio.output_device = None;
-                config.save();
-            }
-        }
-
-        let active_tab = if config.account.is_configured() {
-            ActiveTab::Dialpad
-        } else {
-            ActiveTab::Settings
-        };
-
-        if config.account.is_configured() && config.account.auto_connect {
-            sip.send(SipCommand::Connect {
-                account: config.account.clone(),
-                input_dev: config.audio.input_device.clone(),
-                output_dev: config.audio.output_device.clone(),
-            });
-        }
-
-        Self {
-            config,
-            audio,
-            sip,
-            active_tab,
-            dial_input: String::new(),
-            show_password: false,
-            input_devices,
-            output_devices,
-            contact_search: String::new(),
-            show_add_contact: false,
-            new_contact_name: String::new(),
-            new_contact_number: String::new(),
-            new_contact_notes: String::new(),
-            history_filter: HistoryFilter::All,
-            log_filter: LogFilter::All,
-            selected_log_index: None,
-            status_toast: None,
-            started_at: Instant::now(),
-            last_tab: active_tab,
-            tab_anim_start: Instant::now(),
-            tab_from_right: true,
-            remote_config: None,
-        }
-    }
-
-    /// Construtor do modo `--remote` (F1): a janela é um CLIENTE do daemon.
-    /// Recebe os estados ESPELHO (alimentados pela thread de IPC) e os envolve
-    /// num `SipController` INERTE (sem supervisor/socket/REGISTER) e num
-    /// `AudioEngine` que só referencia o estado (sem abrir dispositivo). Nenhum
-    /// núcleo "dono" é criado aqui — o daemon é o dono. Faz o MÍNIMO: reusa a
-    /// mesma struct/render da janela local, trocando apenas a FONTE do estado.
+    /// Construtor da janela CLIENTE (F2, modo default). A janela NÃO é dona de
+    /// núcleo algum: recebe os estados ESPELHO (alimentados pela thread de IPC a
+    /// partir das `ServerMsg` do daemon) e um `DaemonClient` para ENVIAR os
+    /// comandos. O `SipController` é INERTE (sem supervisor/socket/REGISTER) e o
+    /// `AudioEngine` é inerte (`from_state`, nunca abre PipeWire — fecha o A1).
+    /// Reusa a MESMA struct/render da janela de antes: só muda a FONTE do estado
+    /// (espelho) e o DESTINO das ações (IPC).
     pub fn new_remote(
         cc: &eframe::CreationContext<'_>,
         sip_state: std::sync::Arc<crate::sip::SipSharedState>,
         audio_state: std::sync::Arc<crate::audio::AudioSharedState>,
         remote_config: crate::remote::RemoteConfig,
+        client: crate::remote::DaemonClient,
     ) -> Self {
         theme::configure_style(&cc.egui_ctx);
 
@@ -187,14 +135,18 @@ impl RustSipApp {
             .lock()
             .map(|c| c.clone())
             .unwrap_or_default();
+        // Base dos edge-triggers de conta/áudio (ver campos prev_mirror_*).
+        let config_account_snapshot = config.account.clone();
+        let config_audio_snapshot = config.audio.clone();
 
         let audio = AudioEngine::from_state(audio_state);
         let sip = SipController::new_inert(sip_state);
 
-        // Sem enumerar dispositivos locais (leitura pura; o daemon é o dono do
-        // áudio). As listas ficam vazias — a aba de Config exibe só o estado.
-        let input_devices = Vec::new();
-        let output_devices = Vec::new();
+        // Enumera dispositivos localmente APENAS para listar nos combos (pactl
+        // list é leitura pura — NÃO abre stream PipeWire, não viola o A1). A
+        // TROCA de device envia ClientMsg::Set*Device; o daemon é quem aplica.
+        let input_devices = AudioEngine::list_input_devices();
+        let output_devices = AudioEngine::list_output_devices();
 
         let active_tab = if config.account.is_configured() {
             ActiveTab::Dialpad
@@ -224,7 +176,10 @@ impl RustSipApp {
             last_tab: active_tab,
             tab_anim_start: Instant::now(),
             tab_from_right: true,
-            remote_config: Some(remote_config),
+            remote_config,
+            client,
+            prev_mirror_account: config_account_snapshot,
+            prev_mirror_audio: config_audio_snapshot,
         }
     }
 
@@ -237,59 +192,19 @@ impl RustSipApp {
         if target.is_empty() {
             return;
         }
-        if self.audio.state.mode.load(Ordering::Relaxed) == MODE_LOOPBACK_TEST {
-            self.audio.stop_audio();
-        }
-        self.sip.send(SipCommand::Dial {
-            target,
-            input_dev: self.config.audio.input_device.clone(),
-            output_dev: self.config.audio.output_device.clone(),
-        });
+        // O daemon encerra o loopback antes de discar (apply_command::Dial);
+        // aqui só envia o comando. A UI não toca mais o AudioEngine.
+        self.client.send(ClientMsg::Dial { target });
         self.active_tab = ActiveTab::Dialpad;
     }
 
     fn press_keypad_digit(&mut self, digit: char, in_call: bool) {
-        self.audio
-            .play_keypad_dtmf(digit, self.config.audio.output_device.clone());
-        if in_call {
-            self.sip.send(SipCommand::SendDtmf(digit));
-        } else {
+        // O tom DTMF local e o DTMF SIP são feitos pelo DAEMON (ele é o dono do
+        // áudio e da sessão). A UI só envia o dígito e, fora de chamada, compõe
+        // o número no visor local.
+        self.client.send(ClientMsg::KeypadDigit(digit));
+        if !in_call {
             self.dial_input.push(digit);
-        }
-    }
-
-    fn drain_completed_calls(&mut self) {
-        let mut new_entries = Vec::new();
-        if let Ok(mut q) = self.sip.state.completed_calls.lock() {
-            while let Some(rec) = q.pop_front() {
-                new_entries.push(rec);
-            }
-        }
-        if !new_entries.is_empty() {
-            for rec in new_entries {
-                let contact_name = self
-                    .config
-                    .contacts
-                    .iter()
-                    .find(|c| c.number == rec.number)
-                    .map(|c| c.name.clone())
-                    .unwrap_or(rec.name);
-
-                self.config.history.insert(
-                    0,
-                    CallHistoryEntry {
-                        timestamp: Local::now().format("%d/%m/%Y %H:%M").to_string(),
-                        number: rec.number,
-                        name: contact_name,
-                        direction: rec.direction,
-                        duration_secs: rec.duration_secs,
-                    },
-                );
-            }
-            if self.config.history.len() > 100 {
-                self.config.history.truncate(100);
-            }
-            self.config.save();
         }
     }
 }
@@ -298,17 +213,25 @@ impl eframe::App for RustSipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        // F1 (--remote): recopia o config espelho (contatos/histórico/conta),
-        // que a thread de IPC mantém atualizado a partir do daemon. No modo
-        // local (remote_config None) nada muda.
-        if let Some(ref rc) = self.remote_config {
-            if let Ok(cfg) = rc.lock() {
-                self.config = cfg.clone();
+        // F2: a janela é cliente do daemon. Recopia do espelho (mantido pela
+        // thread de IPC) a cada frame, com cuidado para não apagar o FORMULÁRIO:
+        //   - contatos/histórico: listas de exibição → copia sempre;
+        //   - conta/áudio: são formulário (o usuário digita/arrasta) → copia só
+        //     quando o DAEMON os mudou (Account/AudioCfg mudam o espelho), via
+        //     edge-trigger contra prev_mirror_*. O daemon é o dono do config; a
+        //     janela nunca grava em disco.
+        if let Ok(cfg) = self.remote_config.lock() {
+            self.config.contacts = cfg.contacts.clone();
+            self.config.history = cfg.history.clone();
+            if cfg.account != self.prev_mirror_account {
+                self.config.account = cfg.account.clone();
+                self.prev_mirror_account = cfg.account.clone();
             }
-            // No modo remoto o daemon é o dono do config/histórico — a janela
-            // NÃO drena nem salva local (evita escrever o disco local).
-        } else {
-            self.drain_completed_calls();
+            if cfg.audio != self.prev_mirror_audio {
+                self.config.audio = cfg.audio.clone();
+                self.prev_mirror_audio = cfg.audio.clone();
+            }
+            self.config.password_needs_reentry = cfg.password_needs_reentry;
         }
 
         let reg_status = self
@@ -484,7 +407,7 @@ impl RustSipApp {
                     .corner_radius(CornerRadius::same(theme::R_SM));
 
                     if ui.add(btn).clicked() {
-                        self.sip.send(SipCommand::Disconnect);
+                        self.client.send(ClientMsg::Disconnect);
                     }
                 } else if self.config.account.is_configured() {
                     let btn = egui::Button::new(
@@ -496,11 +419,7 @@ impl RustSipApp {
                     .corner_radius(CornerRadius::same(theme::R_SM));
 
                     if ui.add(btn).clicked() {
-                        self.sip.send(SipCommand::Connect {
-                            account: self.config.account.clone(),
-                            input_dev: self.config.audio.input_device.clone(),
-                            output_dev: self.config.audio.output_device.clone(),
-                        });
+                        self.client.send(ClientMsg::Connect);
                     }
                 }
 
@@ -615,13 +534,10 @@ impl RustSipApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if action_button(ui, "Recusar", Some(Icon::Hangup), STATUS_RED_FILL, 88.0, 32.0).clicked() {
-                                self.sip.send(SipCommand::Hangup);
+                                self.client.send(ClientMsg::Hangup);
                             }
                             if action_button(ui, "Atender", Some(Icon::Phone), STATUS_GREEN, 88.0, 32.0).clicked() {
-                                self.sip.send(SipCommand::Answer {
-                                    input_dev: self.config.audio.input_device.clone(),
-                                    output_dev: self.config.audio.output_device.clone(),
-                                });
+                                self.client.send(ClientMsg::Answer);
                             }
                         });
                     });
@@ -639,7 +555,7 @@ impl RustSipApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if action_button(ui, "Cancelar", Some(Icon::Hangup), STATUS_RED_FILL, 92.0, 32.0).clicked() {
-                                self.sip.send(SipCommand::Hangup);
+                                self.client.send(ClientMsg::Hangup);
                             }
                         });
                     });
@@ -669,7 +585,7 @@ impl RustSipApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if action_button(ui, "Desligar", Some(Icon::Hangup), STATUS_RED_FILL, 92.0, 32.0).clicked() {
-                                self.sip.send(SipCommand::Hangup);
+                                self.client.send(ClientMsg::Hangup);
                             }
                         });
                     });
@@ -693,7 +609,7 @@ impl RustSipApp {
                         if call_control_button(ui, mute_icon, mute_label, is_muted, STATUS_AMBER, btn_w, 30.0)
                             .clicked()
                         {
-                            self.audio.state.muted.store(!is_muted, Ordering::Relaxed);
+                            self.client.send(ClientMsg::SetMuted(!is_muted));
                         }
 
                         // Espera: ação. Pause quando a chamada está ativa, Play (retomar) em espera.
@@ -702,7 +618,7 @@ impl RustSipApp {
                         if call_control_button(ui, hold_icon, hold_label, is_hold, ACCENT_BLUE, btn_w, 30.0)
                             .clicked()
                         {
-                            self.audio.state.on_hold.store(!is_hold, Ordering::Relaxed);
+                            self.client.send(ClientMsg::SetHold(!is_hold));
                         }
                     });
                 }
@@ -864,13 +780,13 @@ impl RustSipApp {
                     && !self.new_contact_name.trim().is_empty()
                     && !self.new_contact_number.trim().is_empty()
                 {
-                    self.config.contacts.push(Contact {
-                        id: format!("{}", Local::now().timestamp_millis()),
+                    // O daemon gera o id, grava e emite Contacts (a lista atualiza
+                    // no espelho). A UI só manda o comando e limpa o formulário.
+                    self.client.send(ClientMsg::AddContact {
                         name: self.new_contact_name.trim().to_string(),
                         number: self.new_contact_number.trim().to_string(),
                         notes: self.new_contact_notes.trim().to_string(),
                     });
-                    self.config.save();
                     self.new_contact_name.clear();
                     self.new_contact_number.clear();
                     self.new_contact_notes.clear();
@@ -896,7 +812,7 @@ impl RustSipApp {
             .collect();
 
         let mut dial_target: Option<String> = None;
-        let mut delete_idx: Option<usize> = None;
+        let mut delete_id: Option<String> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if filtered.is_empty() {
@@ -906,7 +822,7 @@ impl RustSipApp {
                 });
             }
 
-            for (idx, contact) in filtered {
+            for (_idx, contact) in filtered {
                 card_frame()
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -921,7 +837,7 @@ impl RustSipApp {
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if icon_tool_button(ui, Icon::Trash, 26.0, "Excluir", false, BORDER_SUBTLE).clicked() {
-                                    delete_idx = Some(idx);
+                                    delete_id = Some(contact.id.clone());
                                 }
                                 if action_button(ui, "Ligar", Some(Icon::Phone), STATUS_GREEN, 72.0, 26.0).clicked() {
                                     dial_target = Some(contact.number.clone());
@@ -933,9 +849,10 @@ impl RustSipApp {
             }
         });
 
-        if let Some(idx) = delete_idx {
-            self.config.contacts.remove(idx);
-            self.config.save();
+        if let Some(id) = delete_id {
+            // O daemon remove por id, grava e emite Contacts (a lista atualiza
+            // no espelho).
+            self.client.send(ClientMsg::DeleteContact(id));
         }
         if let Some(num) = dial_target {
             self.dial_input = num.clone();
@@ -973,8 +890,8 @@ impl RustSipApp {
                 if !self.config.history.is_empty()
                     && icon_tool_button(ui, Icon::Trash, 26.0, "Limpar histórico", false, BORDER_SUBTLE).clicked()
                 {
-                    self.config.history.clear();
-                    self.config.save();
+                    // O daemon limpa, grava e emite History (o espelho atualiza).
+                    self.client.send(ClientMsg::ClearHistory);
                     self.show_toast("Histórico limpo.");
                 }
             });
@@ -1122,13 +1039,15 @@ impl RustSipApp {
 
                 ui.add_space(10.0);
                 if action_button(ui, "Salvar e Reconectar", Some(Icon::Power), ACCENT_BLUE, ui.available_width(), 34.0).clicked() {
-                    self.config.save();
-                    if self.config.account.is_configured() {
-                        self.sip.send(SipCommand::Connect {
-                            account: self.config.account.clone(),
-                            input_dev: self.config.audio.input_device.clone(),
-                            output_dev: self.config.audio.output_device.clone(),
-                        });
+                    // Um único comando: o daemon grava a conta (único writer),
+                    // reconecta se configurada, e emite Account de volta (o
+                    // formulário é reaplicado só quando esse frame chega).
+                    let configured = self.config.account.is_configured();
+                    self.client.send(ClientMsg::SaveAccount {
+                        account: self.config.account.clone(),
+                        reconnect: true,
+                    });
+                    if configured {
                         self.show_toast("Conectando ao servidor...");
                     }
                 }
@@ -1179,15 +1098,15 @@ impl RustSipApp {
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(self.config.audio.input_device.is_none(), &def_in).clicked() {
                             self.config.audio.input_device = None;
-                            self.config.save();
-                            self.audio.reload_devices_if_active(None, self.config.audio.output_device.clone());
+                            self.prev_mirror_audio.input_device = None;
+                            self.client.send(ClientMsg::SetInputDevice(None));
                         }
                         for dev in &self.input_devices {
                             let sel = self.config.audio.input_device.as_deref() == Some(&dev.id);
                             if ui.selectable_label(sel, dev.display_label()).clicked() {
                                 self.config.audio.input_device = Some(dev.id.clone());
-                                self.config.save();
-                                self.audio.reload_devices_if_active(Some(dev.id.clone()), self.config.audio.output_device.clone());
+                                self.prev_mirror_audio.input_device = Some(dev.id.clone());
+                                self.client.send(ClientMsg::SetInputDevice(Some(dev.id.clone())));
                             }
                         }
                     });
@@ -1221,15 +1140,15 @@ impl RustSipApp {
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(self.config.audio.output_device.is_none(), &def_out).clicked() {
                             self.config.audio.output_device = None;
-                            self.config.save();
-                            self.audio.reload_devices_if_active(self.config.audio.input_device.clone(), None);
+                            self.prev_mirror_audio.output_device = None;
+                            self.client.send(ClientMsg::SetOutputDevice(None));
                         }
                         for dev in &self.output_devices {
                             let sel = self.config.audio.output_device.as_deref() == Some(&dev.id);
                             if ui.selectable_label(sel, dev.display_label()).clicked() {
                                 self.config.audio.output_device = Some(dev.id.clone());
-                                self.config.save();
-                                self.audio.reload_devices_if_active(self.config.audio.input_device.clone(), Some(dev.id.clone()));
+                                self.prev_mirror_audio.output_device = Some(dev.id.clone());
+                                self.client.send(ClientMsg::SetOutputDevice(Some(dev.id.clone())));
                             }
                         }
                     });
@@ -1252,8 +1171,8 @@ impl RustSipApp {
                             .add(egui::Slider::new(&mut self.config.audio.mic_gain, 0.2..=3.0).text("x").trailing_fill(true))
                             .changed()
                         {
-                            self.audio.state.set_mic_gain(self.config.audio.mic_gain);
-                            self.config.save();
+                            self.prev_mirror_audio.mic_gain = self.config.audio.mic_gain;
+                            self.client.send(ClientMsg::SetMicGain(self.config.audio.mic_gain));
                         }
                     });
                 });
@@ -1270,8 +1189,8 @@ impl RustSipApp {
                             .add(egui::Slider::new(&mut self.config.audio.speaker_volume, 0.1..=2.5).text("x").trailing_fill(true))
                             .changed()
                         {
-                            self.audio.state.set_speaker_volume(self.config.audio.speaker_volume);
-                            self.config.save();
+                            self.prev_mirror_audio.speaker_volume = self.config.audio.speaker_volume;
+                            self.client.send(ClientMsg::SetSpeakerVolume(self.config.audio.speaker_volume));
                         }
                     });
                 });
@@ -1288,12 +1207,9 @@ impl RustSipApp {
 
                 if action_button(ui, test_txt, Some(Icon::Speaker), test_col, ui.available_width(), 32.0).clicked() {
                     if is_loopback {
-                        self.audio.stop_audio();
+                        self.client.send(ClientMsg::StopLoopbackTest);
                     } else {
-                        self.audio.start_loopback_test(
-                            self.config.audio.input_device.clone(),
-                            self.config.audio.output_device.clone(),
-                        );
+                        self.client.send(ClientMsg::StartLoopbackTest);
                     }
                 }
             });

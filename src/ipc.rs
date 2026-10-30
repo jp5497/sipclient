@@ -27,14 +27,72 @@ pub const PROTO_VERSION: u32 = 1;
 /// leitura de um frame arbitrariamente grande para a memória.
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 
-/// Mensagens CLIENTE -> SERVIDOR. Na F1 o cliente só manda `Hello`; os comandos
-/// (`Connect`, `Dial`, ...) entram na F2. Mantidos fora deste enum por ora.
+/// Mensagens CLIENTE -> SERVIDOR. A F1 só mandava `Hello`; a F2 adiciona os
+/// comandos de ação — a janela NÃO toca mais SipController/AudioEngine/config
+/// locais, só ENVIA estes frames; o daemon é quem aplica no núcleo e persiste.
+///
+/// TAG ADJACENTE (`tag="t", content="c"`): algumas variantes carregam newtype
+/// com payload não-mapa (`KeypadDigit(char)`, `SetMuted(bool)`,
+/// `SetMicGain(f32)`, `DeleteContact(String)`); a tag adjacente põe o conteúdo
+/// sob `c` e aceita qualquer tipo, igual a `ServerMsg`.
+///
+/// SEGURANÇA: `SaveAccount` carrega a `SipAccountConfig` inteira (inclui a
+/// SENHA). NUNCA logue um frame serializado — `write_frame`/`read_frame`
+/// jamais imprimem o conteúdo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "t")]
+#[serde(tag = "t", content = "c")]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientMsg {
     /// Handshake inicial. `exe_mtime` é o mtime do executável do cliente, para
     /// o daemon detectar binário obsoleto (`stale_exe`) e avisar a janela.
     Hello { proto: u32, exe_mtime: u64 },
+
+    // --- Comandos de sessão (F2) ---
+    /// Registrar no PBX usando a conta/áudio atuais do daemon.
+    Connect,
+    /// Un-REGISTER / desconectar.
+    Disconnect,
+    /// Discar para `target`.
+    Dial { target: String },
+    /// Atender a chamada entrante.
+    Answer,
+    /// Desligar / recusar / cancelar a chamada corrente.
+    Hangup,
+    /// Dígito do teclado: o daemon toca o tom DTMF local e, em chamada, envia
+    /// o DTMF SIP (RFC 2833/INFO conforme o núcleo).
+    KeypadDigit(char),
+
+    // --- Flags de áudio em chamada (F2) ---
+    SetMuted(bool),
+    SetHold(bool),
+
+    // --- Ajustes de áudio persistidos (F2): aplica + grava + emite AudioCfg ---
+    SetMicGain(f32),
+    SetSpeakerVolume(f32),
+    SetInputDevice(Option<String>),
+    SetOutputDevice(Option<String>),
+
+    // --- Teste de áudio (F2) ---
+    StartLoopbackTest,
+    StopLoopbackTest,
+
+    // --- Config persistido (F2): o daemon é o único writer do config.json ---
+    /// Salva a conta; se `reconnect` e a conta estiver configurada, reconecta.
+    /// Emite `Account` de volta (o cliente aplica o formulário só na resposta).
+    SaveAccount {
+        account: SipAccountConfig,
+        reconnect: bool,
+    },
+    /// Adiciona um contato (o daemon gera o `id`), grava e emite `Contacts`.
+    AddContact {
+        name: String,
+        number: String,
+        notes: String,
+    },
+    /// Remove o contato por id, grava e emite `Contacts`.
+    DeleteContact(String),
+    /// Limpa o histórico, grava e emite `History`.
+    ClearHistory,
 }
 
 /// Mensagens SERVIDOR -> CLIENTE.
@@ -96,16 +154,15 @@ pub enum ServerMsg {
     /// backpressure (try_send).
     Hot { mic: f32, spk: f32, tx: u64, rx: u64 },
 
-    // --- Declaradas para o contrato; EMITIDAS só na F2/F3 ---
-    /// Config de áudio mudou (F2+).
-    #[allow(dead_code)]
+    // --- Emitidas a partir da F2 ---
+    /// Config de áudio mudou (F2): gain/volume/device aplicados e gravados.
     AudioCfg(AudioConfig),
     /// Lista de contatos (emitida no connect, L1; e quando mudar na F2+).
     Contacts(Vec<Contact>),
     /// Histórico de chamadas (emitido no connect, L1; e quando mudar na F2+).
     History(Vec<CallHistoryEntry>),
-    /// Conta/credenciais mudaram (F2+).
-    #[allow(dead_code)]
+    /// Conta/credenciais mudaram (F2): resposta a `SaveAccount`. O cliente só
+    /// aplica o formulário de conta quando ESTE frame chega (não a cada tick).
     Account(SipAccountConfig),
     /// Pedido do daemon para a janela se trazer à frente (F3, tray "Mostrar").
     #[allow(dead_code)]
@@ -354,19 +411,49 @@ mod tests {
         }
     }
 
-    /// Round-trip de cada variante de ClientMsg via framing NDJSON.
+    /// Round-trip de cada variante de ClientMsg via framing NDJSON, incluindo
+    /// os comandos de ação da F2 (tag adjacente `t`/`c`).
     #[test]
     fn test_clientmsg_roundtrip() {
-        let msgs = vec![ClientMsg::Hello {
-            proto: PROTO_VERSION,
-            exe_mtime: 1_700_000_000,
-        }];
+        let msgs = vec![
+            ClientMsg::Hello {
+                proto: PROTO_VERSION,
+                exe_mtime: 1_700_000_000,
+            },
+            ClientMsg::Connect,
+            ClientMsg::Disconnect,
+            ClientMsg::Dial {
+                target: "300".into(),
+            },
+            ClientMsg::Answer,
+            ClientMsg::Hangup,
+            ClientMsg::KeypadDigit('#'),
+            ClientMsg::SetMuted(true),
+            ClientMsg::SetHold(false),
+            ClientMsg::SetMicGain(1.75),
+            ClientMsg::SetSpeakerVolume(0.9),
+            ClientMsg::SetInputDevice(Some("alsa_input.pci-0000".into())),
+            ClientMsg::SetOutputDevice(None),
+            ClientMsg::StartLoopbackTest,
+            ClientMsg::StopLoopbackTest,
+            ClientMsg::SaveAccount {
+                account: sample_account(),
+                reconnect: true,
+            },
+            ClientMsg::AddContact {
+                name: "Alice".into(),
+                number: "200".into(),
+                notes: "ramal".into(),
+            },
+            ClientMsg::DeleteContact("c1".into()),
+            ClientMsg::ClearHistory,
+        ];
         for m in msgs {
             let mut buf = Vec::new();
             write_frame(&mut buf, &m).expect("write");
             let mut r = BufReader::new(&buf[..]);
             let got: ClientMsg = read_frame(&mut r).expect("read").expect("some");
-            assert_eq!(got, m);
+            assert_eq!(got, m, "variante de ClientMsg não sobreviveu ao round-trip");
         }
     }
 

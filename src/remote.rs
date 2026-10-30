@@ -57,15 +57,87 @@ fn exe_mtime() -> u64 {
 /// Arc<Mutex<>> que a thread de IPC atualiza e a janela copia por frame.
 pub type RemoteConfig = Arc<Mutex<AppConfig>>;
 
-/// Ponto de entrada do modo remoto. Conecta, faz o handshake e sobe a janela.
+/// Handle de ESCRITA do cliente para o daemon. A janela (F2) envia `ClientMsg`
+/// de comando por aqui; a leitura dos `ServerMsg` fica na thread de IPC. O
+/// `UnixStream` é full-duplex, então um `try_clone` dá o half de escrita para a
+/// UI enquanto a thread lê do outro clone.
+///
+/// Todas as ações da UI passam por `send()`. Uma falha de escrita (daemon caiu)
+/// é guardada em `broken` para a UI poder refletir "desconectado" sem travar.
+/// NUNCA logar o frame (SaveAccount carrega a senha) — só a causa, sem corpo.
+#[derive(Clone)]
+pub struct DaemonClient {
+    writer: Arc<Mutex<UnixStream>>,
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DaemonClient {
+    fn new(writer: UnixStream) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+            broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Envia um comando ao daemon. Best-effort: um erro de escrita marca o
+    /// cliente como quebrado e é silenciado (a thread de leitura também detecta
+    /// o EOF e para de atualizar o espelho). Nunca propaga/loga o conteúdo.
+    pub fn send(&self, msg: ClientMsg) {
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut w) = self.writer.lock() {
+            if ipc::write_frame(&mut *w, &msg).is_err() {
+                self.broken.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Garante um daemon vivo e devolve um `UnixStream` conectado ao socket (ADR
+/// §1 "garante o daemon"). Tenta conectar; se não houver ninguém ouvindo,
+/// lança `rustsip daemon` (processo separado, dono do núcleo SIP/áudio) e faz
+/// retry de connect a cada 100ms por até 3s.
+fn ensure_daemon() -> std::io::Result<UnixStream> {
+    let path = socket_path();
+    // Caminho feliz: daemon já de pé.
+    if let Ok(s) = UnixStream::connect(&path) {
+        return Ok(s);
+    }
+    // Lança o daemon como processo separado (mesmo executável, arg "daemon").
+    // O daemon redireciona o próprio stdio para ~/.config/rustsip/daemon.log;
+    // o lock de instância única garante que um 2º spawn simultâneo sai sozinho.
+    let exe = std::env::current_exe()?;
+    let _ = std::process::Command::new(exe).arg("daemon").spawn()?;
+    // Retry de connect: 100ms * 30 = 3s.
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(&path) {
+            return Ok(s);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "daemon não respondeu no socket {} após 3s",
+            path.display()
+        ),
+    ))
+}
+
+/// Ponto de entrada do MODO DEFAULT da F2 (`rustsip` sem args) e do alias
+/// `--remote`: garante o daemon vivo e sobe a janela JÁ como CLIENTE IPC. A
+/// janela não roda mais SIP/áudio in-process — lê o estado espelho e envia
+/// comandos ao daemon (fecha o achado A1: a UI não dispara áudio/save local).
 pub fn run_remote_window() -> eframe::Result<()> {
     let path = socket_path();
-    let stream = match UnixStream::connect(&path) {
+    let stream = match ensure_daemon() {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "rustsip --remote: não foi possível conectar ao daemon em {} ({e}).\n\
-                 Inicie o daemon com `rustsip daemon` antes.",
+                "rustsip: não foi possível garantir o daemon em {} ({e}).\n\
+                 Tente iniciar manualmente com `rustsip daemon` e verifique \
+                 ~/.config/rustsip/daemon.log.",
                 path.display()
             );
             std::process::exit(1);
@@ -76,6 +148,13 @@ pub fn run_remote_window() -> eframe::Result<()> {
     let sip_state = SipSharedState::new(RtpStats::new());
     let audio_state = AudioSharedState::new();
     let config: RemoteConfig = Arc::new(Mutex::new(AppConfig::default()));
+
+    // Half de ESCRITA para a UI (comandos) e half de LEITURA para a thread de
+    // IPC (frames). try_clone dá dois handles do MESMO socket full-duplex.
+    let write_half = stream
+        .try_clone()
+        .expect("clonar UnixStream para escrita do cliente");
+    let client = DaemonClient::new(write_half);
 
     // Thread dedicada BLOQUEANTE para o socket (std, fora do tokio): envia o
     // Hello e aplica cada ServerMsg no espelho. A janela (egui) roda na main.
@@ -88,16 +167,17 @@ pub fn run_remote_window() -> eframe::Result<()> {
             .spawn(move || {
                 if let Err(e) = ipc_client_loop(stream, sip_state, audio_state, config) {
                     // NUNCA logar o frame (pode conter a senha no Welcome); só a causa.
-                    eprintln!("rustsip --remote: conexão IPC encerrada: {e}");
+                    eprintln!("rustsip: conexão IPC encerrada: {e}");
                 }
             })
             .expect("criar thread cliente IPC");
     }
 
-    // Sobe a janela em modo remoto (SipController inerte + AudioEngine espelho).
+    // Sobe a janela em modo cliente (SipController inerte + AudioEngine espelho
+    // + DaemonClient para enviar comandos).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustSIP — Remoto (daemon)")
+            .with_title("RustSIP — Softphone Nativo Linux")
             .with_app_id("rustsip")
             .with_inner_size([380.0, 640.0])
             .with_min_inner_size([360.0, 560.0]),
@@ -106,7 +186,15 @@ pub fn run_remote_window() -> eframe::Result<()> {
     eframe::run_native(
         "RustSIP",
         options,
-        Box::new(move |cc| Ok(Box::new(RustSipApp::new_remote(cc, sip_state, audio_state, config)))),
+        Box::new(move |cc| {
+            Ok(Box::new(RustSipApp::new_remote(
+                cc,
+                sip_state,
+                audio_state,
+                config,
+                client,
+            )))
+        }),
     )
 }
 
@@ -203,13 +291,36 @@ fn apply_server_msg(
             sip_state.rtp_stats.tx_packets.store(tx, Ordering::Relaxed);
             sip_state.rtp_stats.rx_packets.store(rx, Ordering::Relaxed);
         }
-        // Variantes F2/F3: ainda não emitidas pelo daemon; ignoradas na F1.
-        ServerMsg::AudioCfg(_)
-        | ServerMsg::Contacts(_)
-        | ServerMsg::History(_)
-        | ServerMsg::Account(_)
-        | ServerMsg::Raise
-        | ServerMsg::Shutdown => {}
+        // --- Frames de SEÇÃO (F2): atualizam o espelho por seção ---
+        ServerMsg::Contacts(contacts) => {
+            if let Ok(mut cfg) = config.lock() {
+                cfg.contacts = contacts;
+            }
+        }
+        ServerMsg::History(history) => {
+            if let Ok(mut cfg) = config.lock() {
+                cfg.history = history;
+            }
+        }
+        ServerMsg::AudioCfg(audio) => {
+            // Espelha gain/volume nos átomos (o footer/VU/sliders leem daqui) e
+            // atualiza a seção de áudio do config (devices/valores dos sliders).
+            audio_state.set_mic_gain(audio.mic_gain);
+            audio_state.set_speaker_volume(audio.speaker_volume);
+            if let Ok(mut cfg) = config.lock() {
+                cfg.audio = audio;
+            }
+        }
+        ServerMsg::Account(account) => {
+            // L6: aplica o formulário de conta SÓ quando este frame chega
+            // (resposta a SaveAccount) — nunca a cada tick, para não sobrescrever
+            // o que o usuário está digitando.
+            if let Ok(mut cfg) = config.lock() {
+                cfg.account = account;
+            }
+        }
+        // F3: tray "Mostrar" / shutdown — tratados numa fase futura.
+        ServerMsg::Raise | ServerMsg::Shutdown => {}
     }
 }
 

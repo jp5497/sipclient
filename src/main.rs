@@ -10,14 +10,17 @@ mod sip;
 mod theme;
 mod ui;
 
-use eframe::egui;
-use ui::RustSipApp;
-
 fn main() -> eframe::Result<()> {
-    // Dispatch por argumento (sem clap): `rustsip daemon` roda o modo daemon
-    // headless com bandeja; `rustsip --remote` (ou `remote`) abre a janela em
-    // modo CLIENTE lendo o estado do daemon por socket (F1, read-only); qualquer
-    // outro caso (default) roda EXATAMENTE a janela de hoje, inalterada.
+    // Dispatch por argumento (sem clap):
+    //   `rustsip daemon`           -> modo daemon headless com bandeja (F0);
+    //   `rustsip` (sem args)       -> F2: garante o daemon vivo e abre a JANELA
+    //                                 CLIENTE que fala com ele por IPC. A janela
+    //                                 não roda mais SIP/áudio in-process (fecha o
+    //                                 achado A1);
+    //   `rustsip --remote`/`remote`-> alias explícito do MESMO caminho da janela
+    //                                 cliente (o default o absorveu; mantido por
+    //                                 conveniência/scripts).
+    //
     // args_os (não args): std::env::args() faz PANIC se algum argumento não for
     // UTF-8. O dispatch só compara o 1º arg com literais ASCII, então comparar
     // o OsStr cru evita o panic de borda sem mudar o comportamento.
@@ -30,25 +33,8 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    if matches!(
-        arg1.as_deref(),
-        Some(a) if a == std::ffi::OsStr::new("--remote") || a == std::ffi::OsStr::new("remote")
-    ) {
-        return remote::run_remote_window();
-    }
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RustSIP — Softphone Nativo Linux")
-            .with_app_id("rustsip")
-            .with_inner_size([380.0, 640.0])
-            .with_min_inner_size([360.0, 560.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "RustSIP",
-        options,
-        Box::new(|cc| Ok(Box::new(RustSipApp::new(cc)))),
-    )
+    // Default E alias --remote/remote: a janela cliente do daemon. O
+    // RustSipApp::new in-process foi REMOVIDO (código morto) — a UI é sempre
+    // cliente IPC agora.
+    remote::run_remote_window()
 }
