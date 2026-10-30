@@ -209,6 +209,38 @@ fn ts() -> String {
 /// vários ticks). Um relance dentro desta janela é IGNORADO.
 const RELAUNCH_GUARD: Duration = Duration::from_secs(5);
 
+/// F3 (L4): decisão de o que fazer quando o daemon quer mostrar a janela
+/// (tray "Mostrar" ou auto-show de chamada entrando). Extraída numa função PURA
+/// para ter um teste que quebra se a lógica de relance quebrar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaunchAction {
+    /// Há janela viva: só pede Raise (traz à frente) por broadcast.
+    Raise,
+    /// Sem janela e fora da guarda anti-loop: relança a janela.
+    Spawn,
+    /// Sem janela mas um relance recente ainda está dentro da guarda: ignora
+    /// (evita fork-bomb no `Incoming` que persiste por vários ticks e no
+    /// duplo-clique do tray).
+    Ignore,
+}
+
+/// Regra PURA de relance: `count>0` → Raise; `count==0` e sem relance recente →
+/// Spawn; `count==0` mas o último relance foi há menos que `guard` → Ignore.
+fn relaunch_decision(
+    client_count: usize,
+    last_relaunch: Option<Instant>,
+    now: Instant,
+    guard: Duration,
+) -> RelaunchAction {
+    if client_count > 0 {
+        RelaunchAction::Raise
+    } else if last_relaunch.is_none_or(|t| now.duration_since(t) >= guard) {
+        RelaunchAction::Spawn
+    } else {
+        RelaunchAction::Ignore
+    }
+}
+
 /// Relança a JANELA CLIENTE como processo FILHO do daemon. É o mesmo binário
 /// SEM argumento (o default de `main` = "garante daemon + abre janela cliente";
 /// o daemon já está de pé, então só a janela sobe e conecta ao socket).
@@ -504,19 +536,24 @@ async fn run_inner() -> Result<()> {
                     Ok(CallPhase::Incoming { .. })
                 );
                 if is_incoming && !prev_incoming {
-                    if client_count.load(Ordering::Relaxed) > 0 {
-                        // Há janela: só traz à frente.
-                        println!("[{}] [daemon] chamada entrando: Raise à janela", ts());
-                        let _ = cfg_tx.send(ServerMsg::Raise);
-                    } else {
-                        // Sem janela: relança (respeitando a guarda anti-loop).
-                        let can = last_relaunch.is_none_or(|t| t.elapsed() >= RELAUNCH_GUARD);
-                        if can {
+                    match relaunch_decision(
+                        client_count.load(Ordering::Relaxed),
+                        last_relaunch,
+                        Instant::now(),
+                        RELAUNCH_GUARD,
+                    ) {
+                        RelaunchAction::Raise => {
+                            // Há janela: só traz à frente.
+                            println!("[{}] [daemon] chamada entrando: Raise à janela", ts());
+                            let _ = cfg_tx.send(ServerMsg::Raise);
+                        }
+                        RelaunchAction::Spawn => {
                             println!("[{}] [daemon] chamada entrando: relançando janela", ts());
                             if spawn_window() {
                                 last_relaunch = Some(Instant::now());
                             }
                         }
+                        RelaunchAction::Ignore => {}
                     }
                 }
                 prev_incoming = is_incoming;
@@ -526,18 +563,23 @@ async fn run_inner() -> Result<()> {
                     DaemonEvt::Show => {
                         // Item 1: se há janela cliente conectada, pede Raise por
                         // broadcast; senão, relança a janela (default = cliente).
-                        if client_count.load(Ordering::Relaxed) > 0 {
-                            println!("[{}] [daemon] 'Mostrar': Raise à janela existente", ts());
-                            let _ = cfg_tx.send(ServerMsg::Raise);
-                        } else {
-                            // Guarda anti duplo-clique: ignora se relançou há pouco.
-                            let can = last_relaunch.is_none_or(|t| t.elapsed() >= RELAUNCH_GUARD);
-                            if can {
+                        match relaunch_decision(
+                            client_count.load(Ordering::Relaxed),
+                            last_relaunch,
+                            Instant::now(),
+                            RELAUNCH_GUARD,
+                        ) {
+                            RelaunchAction::Raise => {
+                                println!("[{}] [daemon] 'Mostrar': Raise à janela existente", ts());
+                                let _ = cfg_tx.send(ServerMsg::Raise);
+                            }
+                            RelaunchAction::Spawn => {
                                 println!("[{}] [daemon] 'Mostrar': relançando janela", ts());
                                 if spawn_window() {
                                     last_relaunch = Some(Instant::now());
                                 }
-                            } else {
+                            }
+                            RelaunchAction::Ignore => {
                                 println!("[{}] [daemon] 'Mostrar' ignorado (relance recente)", ts());
                             }
                         }
@@ -567,6 +609,19 @@ async fn run_inner() -> Result<()> {
     // se não há cliente. Feito ANTES do graceful_shutdown para a janela sair
     // junto (e não ficar pendurada tentando reconectar a um socket que já foi).
     let _ = cfg_tx.send(ServerMsg::Shutdown);
+
+    // F3 (M1): o `send` acima só ENFILEIRA o frame no broadcast; quem o escreve
+    // no socket é a task de cada conexão. Se derrubarmos o runtime agora, essa
+    // task pode nunca escrever — a janela vê EOF com shutdown=false, acha que o
+    // daemon CAIU e respawna um daemon novo (ressuscitando o que o "Sair" pediu
+    // para encerrar). Aguardamos `client_count` chegar a 0 (teto ~1s): isso dá
+    // tempo das tasks entregarem o Shutdown e CONFIRMA que a janela fechou.
+    // Teto para não travar o encerramento se uma janela estiver presa.
+    let drain_deadline = Instant::now() + Duration::from_millis(1000);
+    while client_count.load(Ordering::Relaxed) > 0 && Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     graceful_shutdown(&sip, &state, &audio, &config, &cfg_tx).await;
     // Remove o socket IPC (best-effort) para não deixar um arquivo órfão.
     let _ = std::fs::remove_file(&sock_path);
@@ -1541,6 +1596,46 @@ fn daemon_exe_mtime() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F3 (L4): a regra pura de relance. count>0 → Raise; count==0 sem relance
+    /// recente → Spawn; count==0 com relance dentro da guarda → Ignore.
+    #[test]
+    fn test_relaunch_decision() {
+        let guard = Duration::from_secs(5);
+        let now = Instant::now();
+
+        // Há janela viva: sempre Raise, mesmo que nunca tenha relançado.
+        assert_eq!(
+            relaunch_decision(1, None, now, guard),
+            RelaunchAction::Raise
+        );
+        // Há janela viva ignora a guarda (um relance recente não impede o Raise).
+        assert_eq!(
+            relaunch_decision(2, Some(now), now, guard),
+            RelaunchAction::Raise
+        );
+
+        // Sem janela e nunca relançou: Spawn.
+        assert_eq!(
+            relaunch_decision(0, None, now, guard),
+            RelaunchAction::Spawn
+        );
+        // Sem janela e último relance já saiu da guarda (>= guard atrás): Spawn.
+        let old = now.checked_sub(guard).unwrap_or(now);
+        assert_eq!(
+            relaunch_decision(0, Some(old), now, guard),
+            RelaunchAction::Spawn
+        );
+
+        // Sem janela mas relance recente (< guarda atrás): Ignore.
+        let recent = now
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(now);
+        assert_eq!(
+            relaunch_decision(0, Some(recent), now, guard),
+            RelaunchAction::Ignore
+        );
+    }
 
     /// Instância única: o 1º File::try_lock() no mesmo path adquire (Ok(true)),
     /// o 2º com o 1º ainda vivo é recusado (Ok(false)). Reproduz a garantia de

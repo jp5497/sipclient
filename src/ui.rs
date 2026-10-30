@@ -258,6 +258,13 @@ impl eframe::App for RustSipApp {
                 .load(std::sync::atomic::Ordering::Relaxed);
             if !has_tray {
                 self.closing = true;
+                // F3 (M1): sinaliza ao supervisor de IPC que este EOF é um
+                // FECHAMENTO ESPERADO (o Quit vai derrubar o daemon a pedido) —
+                // sem isto o supervisor acharia que o daemon caiu e respawnaria,
+                // ressuscitando o daemon que o Quit acabou de encerrar.
+                self.control
+                    .expect_quit
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.client.send(ClientMsg::Quit);
             }
             // Em ambos os casos deixamos o fechamento do viewport prosseguir
@@ -371,6 +378,24 @@ impl eframe::App for RustSipApp {
                 // assim que a reconexão limpar o flag.
                 if self.client.is_broken() {
                     ctx.request_repaint_after(Duration::from_millis(250));
+                    // F3 (L1): quando o supervisor DESISTIU de respawnar (M2),
+                    // o banner não pode seguir prometendo "reconectando…" para
+                    // sempre — troca para orientar o usuário a reabrir o app.
+                    let gave_up = self
+                        .control
+                        .gave_up
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let (title, hint) = if gave_up {
+                        (
+                            "Serviço RustSIP parado",
+                            "Reabra o RustSIP para reiniciar o serviço.",
+                        )
+                    } else {
+                        (
+                            "Serviço RustSIP parado — reconectando…",
+                            "Se persistir, veja ~/.config/rustsip/daemon.log",
+                        )
+                    };
                     egui::Frame::NONE
                         .fill(BG_CARD)
                         .stroke(Stroke::new(1.0_f32, STATUS_AMBER))
@@ -388,16 +413,14 @@ impl eframe::App for RustSipApp {
                                 ui.add_space(14.0);
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        RichText::new("Serviço RustSIP parado — reconectando…")
+                                        RichText::new(title)
                                             .font(font_bold(FS_LABEL))
                                             .color(TEXT_PRIMARY),
                                     );
                                     ui.label(
-                                        RichText::new(
-                                            "Se persistir, veja ~/.config/rustsip/daemon.log",
-                                        )
-                                        .font(font(FS_MICRO))
-                                        .color(TEXT_MUTED),
+                                        RichText::new(hint)
+                                            .font(font(FS_MICRO))
+                                            .color(TEXT_MUTED),
                                     );
                                 });
                             });

@@ -72,15 +72,29 @@ fn gui_lock_path() -> PathBuf {
     base.join("gui.lock")
 }
 
-/// F3 (item 3): adquire o lock exclusivo da janela. `Ok(file)` = somos a 1ª
-/// janela (mantenha o `File` vivo até o fim do processo). `Err(())` = outra
-/// janela já roda (lock ocupado), a 2ª instância deve pedir Raise e sair.
-///
-/// Mesmo padrão do daemon.lock (File::try_lock). Uma falha de I/O ao abrir/
-/// travar o arquivo NÃO bloqueia a abertura da janela — tratamos como "sem
-/// lock disponível, siga como 1ª instância" (um FS sem suporte a flock não deve
-/// impedir o app de abrir; o custo é só uma possível 2ª janela nesse caso raro).
-fn acquire_gui_lock() -> Result<std::fs::File, ()> {
+/// F3 (item 3 / L3): resultado de `acquire_gui_lock`. Três estados, porque
+/// "não consegui o lock" tem DUAS causas que o chamador deve tratar de forma
+/// OPOSTA:
+///   - `Owner(File)`: somos a 1ª janela. Mantenha o `File` vivo até o fim do
+///     processo (o lock é solto no drop).
+///   - `Busy`: já há OUTRA janela (lock ocupado). A 2ª instância pede Raise e
+///     sai com exit 0 (não abre janela).
+///   - `NoLock`: NÃO deu para criar/travar o lock por erro de I/O (FS sem
+///     flock, /dev/null indisponível, etc.). Degradar ABERTO: seguir como 1ª
+///     instância e ABRIR a janela — um erro de lock não deve impedir o app de
+///     abrir. O custo é uma possível 2ª janela nesse caso raro.
+enum GuiLock {
+    Owner(std::fs::File),
+    Busy,
+    NoLock,
+}
+
+/// F3 (item 3 / L3): adquire o lock exclusivo da janela. Mesmo padrão do
+/// daemon.lock (File::try_lock). Distingue "já há janela" (`Busy`) de "falha de
+/// I/O ao obter o lock" (`NoLock`) — antes ambos devolviam `Err(())` e o
+/// chamador tratava os dois como "já há janela", saindo em SILÊNCIO sem abrir
+/// janela mesmo quando só o lock falhou.
+fn acquire_gui_lock() -> GuiLock {
     let path = gui_lock_path();
     // Garante o diretório (o daemon normalmente já criou, mas a janela pode
     // subir primeiro num ambiente sem auto_connect).
@@ -90,20 +104,20 @@ fn acquire_gui_lock() -> Result<std::fs::File, ()> {
     let file = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(e) => {
+            // Erro de I/O ao criar o lockfile: NÃO sabemos se há outra janela;
+            // degradar aberto (seguir como 1ª instância e abrir a janela).
             eprintln!("rustsip: aviso: gui.lock indisponível ({e}); seguindo sem instância única");
-            // Sem lock: devolve um handle "sempre dono" impossível — como não há
-            // File, seguimos como 1ª instância abrindo um arquivo temporário em
-            // memória não é trivial; então sinalizamos 1ª instância devolvendo
-            // um File para /dev/null que nunca bloqueia ninguém.
-            return std::fs::File::create("/dev/null").map_err(|_| ());
+            return GuiLock::NoLock;
         }
     };
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(()),
+        Ok(()) => GuiLock::Owner(file),
+        // Lock ocupado: há OUTRA janela viva.
+        Err(std::fs::TryLockError::WouldBlock) => GuiLock::Busy,
+        // Erro de I/O ao travar: degradar aberto (1ª instância).
         Err(std::fs::TryLockError::Error(e)) => {
             eprintln!("rustsip: aviso: travar gui.lock falhou ({e}); seguindo como 1ª instância");
-            Ok(file)
+            GuiLock::NoLock
         }
     }
 }
@@ -215,6 +229,16 @@ pub struct WindowControl {
     /// comportamento de FECHAR a janela: com tray, só encerra a janela; sem
     /// tray, encerra o daemon também (ClientMsg::Quit).
     pub tray_available: std::sync::atomic::AtomicBool,
+    /// F3 (M1): o usuário pediu para encerrar (fechou a janela sem tray → Quit,
+    /// ou está fechando de propósito). Um EOF no socket DEPOIS disto é um
+    /// "fechamento esperado" — o supervisor NÃO deve respawnar o daemon (senão
+    /// o fechar-sem-tray ressuscita o daemon que o Quit acabou de derrubar).
+    pub expect_quit: std::sync::atomic::AtomicBool,
+    /// F3 (M2/L1): o supervisor já GASTOU o respawn automático desta vida e
+    /// desistiu de ressuscitar o daemon (a 1ª tentativa de respawn não colou).
+    /// A UI troca o banner de "reconectando…" para "reabra o RustSIP". É só
+    /// leitura para a UI; quem seta é o `reconnect_loop`.
+    pub gave_up: std::sync::atomic::AtomicBool,
     /// Clone do `egui::Context` para a thread de IPC pedir repaint quando um
     /// sinal chega com a janela ociosa em background.
     pub ctx: Mutex<Option<egui::Context>>,
@@ -228,6 +252,8 @@ impl WindowControl {
             // Assume true até o Welcome dizer o contrário — evita que um fechar
             // antes do Welcome derrube o daemon por engano.
             tray_available: std::sync::atomic::AtomicBool::new(true),
+            expect_quit: std::sync::atomic::AtomicBool::new(false),
+            gave_up: std::sync::atomic::AtomicBool::new(false),
             ctx: Mutex::new(None),
         })
     }
@@ -306,18 +332,20 @@ pub fn run_remote_window() -> eframe::Result<()> {
     let path = socket_path();
 
     // F3 (item 3): INSTÂNCIA ÚNICA da janela via `gui.lock` (mesmo padrão do
-    // daemon.lock da F0: File::try_lock). Se outra janela já roda, esta 2ª
-    // instância NÃO abre uma janela — conecta ao daemon só para disparar um
-    // RequestShow (o daemon faz broadcast de Raise à janela existente) e sai 0.
-    // O lock é soltado no drop; por isso o File DEVE viver até o fim do processo
-    // — guardamos num Option mantido vivo até depois do run_native (abaixo).
+    // daemon.lock da F0: File::try_lock). `Busy` → já há janela: esta 2ª
+    // instância NÃO abre janela, só dispara RequestShow (o daemon faz broadcast
+    // de Raise à janela existente) e sai 0. `Owner` → somos a 1ª: o File DEVE
+    // viver até o fim do processo (mantido no Option abaixo). `NoLock` → erro
+    // de I/O no lock: degradar ABERTO (seguir como 1ª instância, abrir a janela
+    // sem garantia de instância única — não fechar o app por falha de lock).
     let gui_lock: Option<std::fs::File> = match acquire_gui_lock() {
-        Ok(f) => Some(f),
-        Err(()) => {
+        GuiLock::Owner(f) => Some(f),
+        GuiLock::Busy => {
             // Lock ocupado: já há uma janela. Pede Raise e sai.
             request_show_existing();
             std::process::exit(0);
         }
+        GuiLock::NoLock => None,
     };
 
     let stream = match ensure_daemon() {
@@ -364,7 +392,13 @@ pub fn run_remote_window() -> eframe::Result<()> {
         let mut stream = Some(stream);
         std::thread::Builder::new()
             .name("rustsip-ipc-client".to_string())
-            .spawn(move || loop {
+            .spawn(move || {
+            // F3 (M2): o respawn automático é 1x POR VIDA desta janela, não por
+            // queda. Depois do 1º respawn, quedas seguintes só tentam CONNECT
+            // (não spawnam de novo) — um daemon que sobe, aceita e crasha não
+            // pode gerar loop respawn→connect→crash→respawn.
+            let mut respawned = false;
+            loop {
                 // Pega o stream atual (o 1º já conectado; os seguintes vêm do
                 // reconnect abaixo).
                 let s = match stream.take() {
@@ -383,16 +417,24 @@ pub fn run_remote_window() -> eframe::Result<()> {
                     eprintln!("rustsip: conexão IPC encerrada: {e}");
                 }
 
-                // Shutdown anunciado pelo daemon: EOF esperado, sem banner, sem
-                // reconexão. A UI fecha pelo handler de Shutdown.
-                if control.shutdown.load(Ordering::Relaxed) {
+                // FECHAMENTO ESPERADO (M1): não respawnar.
+                //   - Shutdown anunciado pelo daemon: EOF esperado, a UI fecha
+                //     pelo handler de Shutdown.
+                //   - expect_quit: o usuário fechou a janela sem tray (mandou
+                //     Quit) ou está fechando de propósito — o EOF que vem a
+                //     seguir é o daemon encerrando a pedido, NÃO uma queda. Sem
+                //     este guard, o fechar-sem-tray ressuscitaria o daemon que o
+                //     Quit acabou de derrubar.
+                if control.shutdown.load(Ordering::Relaxed)
+                    || control.expect_quit.load(Ordering::Relaxed)
+                {
                     break;
                 }
 
-                // Queda inesperada: sobe o banner e tenta reconectar a cada 1s.
+                // Queda INESPERADA: sobe o banner e tenta reconectar.
                 client.mark_broken();
                 control.wake();
-                match reconnect_loop(&control) {
+                match reconnect_loop(&control, &mut respawned) {
                     Some(new_stream) => {
                         let wh = match new_stream.try_clone() {
                             Ok(w) => w,
@@ -406,10 +448,12 @@ pub fn run_remote_window() -> eframe::Result<()> {
                         control.wake();
                         stream = Some(new_stream);
                     }
-                    // reconnect_loop só retorna None quando um Shutdown chegou no
-                    // meio (improvável sem socket) — encerra.
+                    // None: ou um Shutdown/Quit chegou no meio, ou o supervisor
+                    // DESISTIU de respawnar (gave_up setado, banner já trocado).
+                    // Em ambos encerra o loop de reconexão.
                     None => break,
                 }
+            }
             })
             .expect("criar thread cliente IPC");
     }
@@ -448,29 +492,44 @@ pub fn run_remote_window() -> eframe::Result<()> {
     result
 }
 
-/// F3 (item 7): tenta reconectar ao daemon após uma queda, SEM entrar em loop
-/// de respawn. Estratégia:
-///   1. Primeira tentativa: `ensure_daemon()` — respawna o daemon UMA vez (ele
-///      próprio faz no máx 1 spawn + retry de connect por 3s).
-///   2. Se falhar, as tentativas seguintes só fazem `connect` a cada 1s — NÃO
-///      respawnam de novo (um respawn por segundo seria um loop de processos,
-///      proibido). Assim, se o daemon voltar por conta própria (ex. o usuário
-///      reinicia via tray/systemd), reconectamos; senão o banner fica visível
-///      indefinidamente com o ponteiro para o log, sem fork-bomb.
+/// F3 (item 7 / M2): tenta reconectar ao daemon após uma queda, SEM entrar em
+/// loop de respawn. O respawn automático é 1x POR VIDA da janela (`respawned`),
+/// não por queda:
+///   1. Se AINDA não respawnamos nesta vida: `ensure_daemon()` — respawna o
+///      daemon UMA vez (ele próprio faz no máx 1 spawn + retry de connect por
+///      3s). Marca `respawned=true`. Se COLAR, devolve o stream.
+///      Se a 1ª tentativa de respawn NÃO colar, DESISTIMOS: seta `gave_up` (a
+///      UI troca o banner para "reabra o RustSIP") e devolve None. A spec é
+///      "1x; se falhar, para de respawnar".
+///   2. Se JÁ respawnamos nesta vida (queda posterior de um daemon que subiu e
+///      caiu): NÃO respawna de novo — só tenta `connect` a cada 1s. Se o daemon
+///      voltar por conta própria (tray/systemd/usuário), reconectamos; senão o
+///      banner fica visível sem fork-bomb. Isto fecha o loop infinito
+///      respawn→connect→crash→respawn.
 ///
-/// Para quando conectar (Some) ou quando um Shutdown for anunciado (None).
-fn reconnect_loop(control: &Arc<WindowControl>) -> Option<UnixStream> {
-    if control.shutdown.load(Ordering::Relaxed) {
+/// Para quando conectar (Some) ou quando desistir / um Shutdown-Quit for
+/// anunciado (None).
+fn reconnect_loop(control: &Arc<WindowControl>, respawned: &mut bool) -> Option<UnixStream> {
+    if control.shutdown.load(Ordering::Relaxed) || control.expect_quit.load(Ordering::Relaxed) {
         return None;
     }
-    // (1) Uma única tentativa de respawn + connect.
-    if let Ok(s) = ensure_daemon() {
-        return Some(s);
+
+    if !*respawned {
+        // (1) Primeira e ÚNICA tentativa de respawn nesta vida.
+        *respawned = true;
+        if let Ok(s) = ensure_daemon() {
+            return Some(s);
+        }
+        // O respawn não colou: para de respawnar e avisa a UI.
+        control.gave_up.store(true, Ordering::Relaxed);
+        control.wake();
+        return None;
     }
-    // (2) Só reconecta ao socket existente daqui em diante (sem novo spawn).
+
+    // (2) Já gastamos o respawn: só reconecta ao socket existente (sem spawn).
     let path = socket_path();
     loop {
-        if control.shutdown.load(Ordering::Relaxed) {
+        if control.shutdown.load(Ordering::Relaxed) || control.expect_quit.load(Ordering::Relaxed) {
             return None;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
