@@ -2,6 +2,7 @@ mod audio;
 mod codec;
 mod config;
 mod crypto;
+mod daemon;
 mod rtp;
 mod sip;
 mod theme;
@@ -11,6 +12,17 @@ use eframe::egui;
 use ui::RustSipApp;
 
 fn main() -> eframe::Result<()> {
+    // Dispatch por argumento (sem clap): `rustsip daemon` roda o modo daemon
+    // headless com bandeja; qualquer outro caso (default) roda EXATAMENTE a
+    // janela de hoje, inalterada.
+    if std::env::args().nth(1).as_deref() == Some("daemon") {
+        if let Err(e) = daemon::run() {
+            eprintln!("rustsip daemon: erro fatal: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RustSIP — Softphone Nativo Linux")

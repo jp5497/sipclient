@@ -7,6 +7,7 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +61,10 @@ pub struct SipSharedState {
     pub reg_status: Mutex<RegistrationStatus>,
     pub call_phase: Mutex<CallPhase>,
     pub logs: Mutex<VecDeque<SipLogEntry>>,
+    /// Contador monotônico incrementado a cada `add_log`. Permite a um
+    /// observador (ex. o daemon na F1) detectar que há log novo sem travar o
+    /// Mutex de `logs` nem comparar conteúdo — basta comparar o seq lido antes.
+    pub log_seq: AtomicU64,
     pub completed_calls: Mutex<VecDeque<CompletedCallRecord>>,
     pub rtp_stats: Arc<RtpStats>,
     pub detected_public_addr: Mutex<Option<String>>,
@@ -71,6 +76,7 @@ impl SipSharedState {
             reg_status: Mutex::new(RegistrationStatus::Disconnected),
             call_phase: Mutex::new(CallPhase::Idle),
             logs: Mutex::new(VecDeque::with_capacity(200)),
+            log_seq: AtomicU64::new(0),
             completed_calls: Mutex::new(VecDeque::new()),
             rtp_stats,
             detected_public_addr: Mutex::new(None),
@@ -90,6 +96,9 @@ impl SipSharedState {
             }
             logs.push_back(entry);
         }
+        // Sinaliza "há log novo" para observadores (F1). Relaxed basta: é um
+        // contador-gatilho, não há dado protegido por esta ordem.
+        self.log_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_reg_status(&self, status: RegistrationStatus) {
