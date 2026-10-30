@@ -398,7 +398,19 @@ pub fn read_frame<R: BufRead, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result
     if buf.len() > MAX_FRAME_BYTES {
         bail!("linha IPC excede o teto de {} bytes", MAX_FRAME_BYTES);
     }
-    let msg = serde_json::from_slice::<T>(&buf)?;
+    // SEGURANÇA: o Display de um serde_json::Error de tipo (classify()==Data)
+    // cita o VALOR do campo ofensor — que num frame IPC pode ser a SENHA
+    // (Welcome/Account/SaveAccount). Descartamos o Display e mantemos só
+    // metadados não-sensíveis (categoria + posição + tamanho).
+    let msg = serde_json::from_slice::<T>(&buf).map_err(|e| {
+        anyhow::anyhow!(
+            "frame IPC invalido ({:?}, {} bytes, linha {} col {})",
+            e.classify(),
+            buf.len(),
+            e.line(),
+            e.column()
+        )
+    })?;
     Ok(Some(msg))
 }
 
@@ -602,6 +614,65 @@ mod tests {
         assert!(
             drift <= 50,
             "drift de reconstrução {drift}ms excede ±50ms (orig={orig_elapsed} new={new_elapsed})"
+        );
+    }
+
+    /// SEGURANÇA (parecer dev-security): um erro de desserialização de frame
+    /// IPC NÃO pode citar o VALOR de um campo (o Display de um
+    /// serde_json::Error de tipo cita o valor ofensor, que pode ser a SENHA).
+    /// Caso 1: erro de TIPO (classify()==Data). Serializamos um Welcome VÁLIDO
+    /// e adulteramos `register_expires` (u32) para a STRING "segredo"; o serde
+    /// citaria esse valor na mensagem — o Err formatado não pode conter
+    /// "segredo". (Serializar+adulterar evita depender da forma exata do JSON.)
+    #[test]
+    fn test_deser_type_error_nao_vaza_valor() {
+        let welcome = ServerMsg::Welcome {
+            proto: PROTO_VERSION,
+            daemon_pid: 1,
+            stale_exe: false,
+            tray_available: true,
+            account: sample_account(),
+            audio: AudioConfig::default(),
+            contacts: vec![],
+            history: vec![],
+            password_needs_reentry: false,
+            reg: RegistrationStatus::Registered,
+            call: CallPhaseWire::Idle,
+            public_addr: None,
+            flags: FlagsWire { muted: false, on_hold: false, mode: 0 },
+            log_seq: 0,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &welcome).expect("write");
+        let line = String::from_utf8(buf).expect("utf8");
+        // register_expires é 300 em sample_account() -> vira a string "segredo"
+        // (tipo errado para o u32 -> erro Data citando o valor).
+        let tampered = line.replace("\"register_expires\":300", "\"register_expires\":\"segredo\"");
+        assert!(tampered.contains("\"segredo\""), "adulteração não aplicou");
+
+        let mut r = BufReader::new(tampered.as_bytes());
+        let res: Result<Option<ServerMsg>> = read_frame(&mut r);
+        let err = res.expect_err("register_expires string deveria falhar na desserialização");
+        let shown = format!("{err:#}"); // cadeia anyhow completa
+        assert!(
+            !shown.contains("segredo"),
+            "erro de desserialização VAZOU o valor do campo: {shown}"
+        );
+    }
+
+    /// Caso 2: tag de variante desconhecida igual a "segredo". O Display do
+    /// serde cita a tag desconhecida ("unknown variant `segredo`, ...") — o
+    /// Err sanitizado não pode conter "segredo".
+    #[test]
+    fn test_deser_unknown_tag_nao_vaza_valor() {
+        let frame = b"{\"t\":\"segredo\",\"c\":null}\n";
+        let mut r = BufReader::new(&frame[..]);
+        let res: Result<Option<ServerMsg>> = read_frame(&mut r);
+        let err = res.expect_err("tag desconhecida deveria falhar na desserialização");
+        let shown = format!("{err:#}");
+        assert!(
+            !shown.contains("segredo"),
+            "erro de desserialização VAZOU o valor do campo: {shown}"
         );
     }
 }

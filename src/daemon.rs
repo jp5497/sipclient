@@ -1575,7 +1575,20 @@ async fn read_client_frame<R: AsyncBufReadExt + Unpin>(
     if buf.len() > MAX_FRAME_BYTES {
         anyhow::bail!("Hello IPC excede o teto de {} bytes", MAX_FRAME_BYTES);
     }
-    let msg = serde_json::from_slice::<ClientMsg>(&buf)?;
+    // SEGURANÇA: o Display de um serde_json::Error de tipo (classify()==Data)
+    // cita o VALOR do campo ofensor — que num ClientMsg pode ser a SENHA
+    // (SaveAccount{account: SipAccountConfig}). Este erro vai pro stdout do
+    // daemon -> daemon.log (persiste em disco), então descartamos o Display e
+    // mantemos só metadados não-sensíveis.
+    let msg = serde_json::from_slice::<ClientMsg>(&buf).map_err(|e| {
+        anyhow::anyhow!(
+            "frame IPC invalido ({:?}, {} bytes, linha {} col {})",
+            e.classify(),
+            buf.len(),
+            e.line(),
+            e.column()
+        )
+    })?;
     Ok(Some(msg))
 }
 
