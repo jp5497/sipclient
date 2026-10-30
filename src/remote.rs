@@ -23,6 +23,7 @@ use crate::ui::RustSipApp;
 use eframe::egui;
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -107,8 +108,32 @@ fn ensure_daemon() -> std::io::Result<UnixStream> {
     // Lança o daemon como processo separado (mesmo executável, arg "daemon").
     // O daemon redireciona o próprio stdio para ~/.config/rustsip/daemon.log;
     // o lock de instância única garante que um 2º spawn simultâneo sai sozinho.
+    //
+    // M2: o daemon tem que SOBREVIVER ao fim da janela e ao Ctrl-C no terminal
+    // de onde o `rustsip` foi lançado (objetivo central do ADR: registro SIP
+    // contínuo com a janela fechada). Sem grupo próprio, o SIGINT do Ctrl-C vai
+    // ao grupo inteiro do terminal e derruba o daemon num shutdown gracioso
+    // (un-REGISTER), matando o binding. `.process_group(0)` coloca o daemon em
+    // seu próprio grupo (desacoplado do SIGINT do terminal) e `.stdin(null)`
+    // solta a entrada controladora. Ambos são std estável, sem dep nova.
     let exe = std::env::current_exe()?;
-    let _ = std::process::Command::new(exe).arg("daemon").spawn()?;
+    let child = std::process::Command::new(exe)
+        .arg("daemon")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .spawn()?;
+
+    // BÔNUS M2: o Child era descartado sem wait — se o daemon morresse antes da
+    // janela viraria zumbi (entrada na tabela de processos até o pai sair).
+    // Uma thread detached faz o reap. A F3 (relaunch da janela) vai reencostar
+    // neste spawn; por ora isto basta e é trivial.
+    std::thread::Builder::new()
+        .name("rustsip-daemon-reaper".to_string())
+        .spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        })
+        .ok();
     // Retry de connect: 100ms * 30 = 3s.
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -271,6 +271,46 @@ async fn run_inner() -> Result<()> {
         audio.state.set_mic_gain(cfg.audio.mic_gain);
         audio.state.set_speaker_volume(cfg.audio.speaker_volume);
     }
+
+    // M1: limpa devices salvos que não existem mais ANTES de conectar. A F2
+    // removeu do ui.rs::RustSipApp::new a lógica que zerava input_device/
+    // output_device quando o id salvo não está mais na lista atual (ex. headset
+    // USB salvo e depois desconectado). Sem isso, o auto_connect abaixo passaria
+    // um id fantasma ao SipController e o pa_simple_new falharia no daemon,
+    // deixando a chamada MUDA. As funções list_*_devices são read-only (pactl),
+    // seguras de rodar no boot do daemon. Grava no máximo uma vez.
+    {
+        let input_devices = AudioEngine::list_input_devices();
+        let output_devices = AudioEngine::list_output_devices();
+        let mut cfg = config.lock().unwrap();
+        let mut dirty = false;
+        if let Some(ref saved_in) = cfg.audio.input_device {
+            if !input_devices.iter().any(|d| &d.id == saved_in) {
+                println!(
+                    "[{}] [daemon] M1: input_device salvo '{}' não existe mais; zerando",
+                    ts(),
+                    saved_in
+                );
+                cfg.audio.input_device = None;
+                dirty = true;
+            }
+        }
+        if let Some(ref saved_out) = cfg.audio.output_device {
+            if !output_devices.iter().any(|d| &d.id == saved_out) {
+                println!(
+                    "[{}] [daemon] M1: output_device salvo '{}' não existe mais; zerando",
+                    ts(),
+                    saved_out
+                );
+                cfg.audio.output_device = None;
+                dirty = true;
+            }
+        }
+        if dirty {
+            cfg.save();
+        }
+    }
+
     let sip = SipController::new(audio.clone());
     let state = sip.state.clone();
 
@@ -390,7 +430,7 @@ async fn run_inner() -> Result<()> {
     loop {
         tokio::select! {
             _ = drain_tick.tick() => {
-                drain_completed_calls(&state, &config);
+                drain_completed_calls(&state, &config, &cfg_tx);
             }
             Some(evt) = evt_rx.recv() => {
                 match evt {
@@ -418,7 +458,7 @@ async fn run_inner() -> Result<()> {
         }
     }
 
-    graceful_shutdown(&sip, &state, &audio, &config).await;
+    graceful_shutdown(&sip, &state, &audio, &config, &cfg_tx).await;
     // Remove o socket IPC (best-effort) para não deixar um arquivo órfão.
     let _ = std::fs::remove_file(&sock_path);
     // Drop do _tray_handle aqui remove o ícone da bandeja.
@@ -429,7 +469,17 @@ async fn run_inner() -> Result<()> {
 /// Porta da lógica de `ui.rs::drain_completed_calls` para o daemon: move os
 /// registros de chamada concluída para `config.history` e persiste. É o único
 /// ponto que escreve o config no modo daemon.
-fn drain_completed_calls(state: &Arc<SipSharedState>, config: &Arc<Mutex<AppConfig>>) {
+///
+/// H1: quando HOUVE chamada nova (`new_entries` não vazio), após gravar faz
+/// broadcast de `ServerMsg::History` por `cfg_tx` a todos os clientes — assim a
+/// aba Histórico da janela atualiza na hora (antes da F2 isso vinha só no
+/// Welcome, então a aba ficava parada até reabrir a janela). O snapshot do
+/// histórico é clonado SOB o lock e o lock é SOLTO antes do send.
+fn drain_completed_calls(
+    state: &Arc<SipSharedState>,
+    config: &Arc<Mutex<AppConfig>>,
+    cfg_tx: &tokio::sync::broadcast::Sender<ServerMsg>,
+) {
     let mut new_entries = Vec::new();
     if let Ok(mut q) = state.completed_calls.lock() {
         while let Some(rec) = q.pop_front() {
@@ -439,33 +489,39 @@ fn drain_completed_calls(state: &Arc<SipSharedState>, config: &Arc<Mutex<AppConf
     if new_entries.is_empty() {
         return;
     }
-    let mut config = match config.lock() {
-        Ok(c) => c,
-        Err(_) => return,
+    let history_snapshot = {
+        let mut config = match config.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for rec in new_entries {
+            let contact_name = config
+                .contacts
+                .iter()
+                .find(|c| c.number == rec.number)
+                .map(|c| c.name.clone())
+                .unwrap_or(rec.name);
+            config.history.insert(
+                0,
+                crate::config::CallHistoryEntry {
+                    timestamp: Local::now().format("%d/%m/%Y %H:%M").to_string(),
+                    number: rec.number,
+                    name: contact_name,
+                    direction: rec.direction,
+                    duration_secs: rec.duration_secs,
+                },
+            );
+        }
+        if config.history.len() > 100 {
+            config.history.truncate(100);
+        }
+        config.save();
+        config.history.clone()
     };
-    for rec in new_entries {
-        let contact_name = config
-            .contacts
-            .iter()
-            .find(|c| c.number == rec.number)
-            .map(|c| c.name.clone())
-            .unwrap_or(rec.name);
-        config.history.insert(
-            0,
-            crate::config::CallHistoryEntry {
-                timestamp: Local::now().format("%d/%m/%Y %H:%M").to_string(),
-                number: rec.number,
-                name: contact_name,
-                direction: rec.direction,
-                duration_secs: rec.duration_secs,
-            },
-        );
-    }
-    if config.history.len() > 100 {
-        config.history.truncate(100);
-    }
-    config.save();
     println!("[{}] [daemon] histórico atualizado e salvo", ts());
+    // H1: emite a lista nova a todos os clientes (lock já solto). Se não há
+    // cliente conectado o broadcast é no-op (nenhum receiver) — inofensivo.
+    let _ = cfg_tx.send(ServerMsg::History(history_snapshot));
 }
 
 /// Encerramento gracioso: Hangup se em chamada + Disconnect (un-REGISTER) com
@@ -476,6 +532,7 @@ async fn graceful_shutdown(
     state: &Arc<SipSharedState>,
     audio: &AudioEngine,
     config: &Arc<Mutex<AppConfig>>,
+    cfg_tx: &tokio::sync::broadcast::Sender<ServerMsg>,
 ) {
     let in_call = matches!(
         state.call_phase.lock().map(|p| p.clone()),
@@ -529,7 +586,7 @@ async fn graceful_shutdown(
 
     audio.stop_audio();
     // Drain final para não perder a última chamada no histórico.
-    drain_completed_calls(state, config);
+    drain_completed_calls(state, config, cfg_tx);
 
     // O unlink do socket IPC é feito pelo chamador (run_inner) após este retorno.
     let _ = std::io::stdout().flush();
