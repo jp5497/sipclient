@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RegistrationStatus {
     Disconnected,
     Connecting,
@@ -164,6 +164,18 @@ impl SipController {
 
     pub fn send(&self, cmd: SipCommand) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Controlador INERTE para o modo `--remote` (F1, read-only via IPC): NÃO
+    /// sobe a thread do supervisor SIP, logo não abre socket nem faz REGISTER —
+    /// o daemon é o dono do núcleo. O `state` retornado é o ESPELHO que a thread
+    /// de IPC preenche a partir das `ServerMsg`. `send()` vira no-op (o receptor
+    /// do canal é descartado), pois comandos só chegam na F2.
+    pub fn new_inert(state: Arc<SipSharedState>) -> Self {
+        // O receptor é descartado imediatamente: send() não entrega a ninguém
+        // (retorna Err, ignorado) e nenhuma task roda.
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        Self { state, cmd_tx }
     }
 }
 

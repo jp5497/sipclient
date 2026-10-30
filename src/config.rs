@@ -17,7 +17,7 @@ impl TransportProtocol {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct SipAccountConfig {
     pub display_name: String,
     pub username: String,
@@ -109,7 +109,7 @@ impl SipAccountConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioConfig {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
@@ -128,7 +128,7 @@ impl Default for AudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Contact {
     pub id: String,
     pub name: String,
@@ -143,7 +143,7 @@ pub enum CallDirection {
     Missed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CallHistoryEntry {
     pub timestamp: String,
     pub number: String,

@@ -3,6 +3,8 @@ mod codec;
 mod config;
 mod crypto;
 mod daemon;
+mod ipc;
+mod remote;
 mod rtp;
 mod sip;
 mod theme;
@@ -13,14 +15,20 @@ use ui::RustSipApp;
 
 fn main() -> eframe::Result<()> {
     // Dispatch por argumento (sem clap): `rustsip daemon` roda o modo daemon
-    // headless com bandeja; qualquer outro caso (default) roda EXATAMENTE a
-    // janela de hoje, inalterada.
-    if std::env::args().nth(1).as_deref() == Some("daemon") {
+    // headless com bandeja; `rustsip --remote` (ou `remote`) abre a janela em
+    // modo CLIENTE lendo o estado do daemon por socket (F1, read-only); qualquer
+    // outro caso (default) roda EXATAMENTE a janela de hoje, inalterada.
+    let arg1 = std::env::args().nth(1);
+    if arg1.as_deref() == Some("daemon") {
         if let Err(e) = daemon::run() {
             eprintln!("rustsip daemon: erro fatal: {e:#}");
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    if matches!(arg1.as_deref(), Some("--remote") | Some("remote")) {
+        return remote::run_remote_window();
     }
 
     let options = eframe::NativeOptions {

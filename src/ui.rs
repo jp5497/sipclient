@@ -93,6 +93,11 @@ pub struct RustSipApp {
     last_tab: ActiveTab,
     tab_anim_start: Instant,
     tab_from_right: bool, // true = aba nova entra da direita (avançou)
+
+    // F1 (--remote): quando presente, a janela é um CLIENTE do daemon. O config
+    // (contatos/histórico/conta) vive neste espelho Arc<Mutex<>> que a thread de
+    // IPC atualiza; o update() copia dele por frame. None = janela local normal.
+    remote_config: Option<crate::remote::RemoteConfig>,
 }
 
 impl RustSipApp {
@@ -158,6 +163,68 @@ impl RustSipApp {
             last_tab: active_tab,
             tab_anim_start: Instant::now(),
             tab_from_right: true,
+            remote_config: None,
+        }
+    }
+
+    /// Construtor do modo `--remote` (F1): a janela é um CLIENTE do daemon.
+    /// Recebe os estados ESPELHO (alimentados pela thread de IPC) e os envolve
+    /// num `SipController` INERTE (sem supervisor/socket/REGISTER) e num
+    /// `AudioEngine` que só referencia o estado (sem abrir dispositivo). Nenhum
+    /// núcleo "dono" é criado aqui — o daemon é o dono. Faz o MÍNIMO: reusa a
+    /// mesma struct/render da janela local, trocando apenas a FONTE do estado.
+    pub fn new_remote(
+        cc: &eframe::CreationContext<'_>,
+        sip_state: std::sync::Arc<crate::sip::SipSharedState>,
+        audio_state: std::sync::Arc<crate::audio::AudioSharedState>,
+        remote_config: crate::remote::RemoteConfig,
+    ) -> Self {
+        theme::configure_style(&cc.egui_ctx);
+
+        // Snapshot inicial do config espelho (vazio até o Welcome chegar; o
+        // update() o recopia a cada frame).
+        let config = remote_config
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+
+        let audio = AudioEngine::from_state(audio_state);
+        let sip = SipController::new_inert(sip_state);
+
+        // Sem enumerar dispositivos locais (leitura pura; o daemon é o dono do
+        // áudio). As listas ficam vazias — a aba de Config exibe só o estado.
+        let input_devices = Vec::new();
+        let output_devices = Vec::new();
+
+        let active_tab = if config.account.is_configured() {
+            ActiveTab::Dialpad
+        } else {
+            ActiveTab::Settings
+        };
+
+        Self {
+            config,
+            audio,
+            sip,
+            active_tab,
+            dial_input: String::new(),
+            show_password: false,
+            input_devices,
+            output_devices,
+            contact_search: String::new(),
+            show_add_contact: false,
+            new_contact_name: String::new(),
+            new_contact_number: String::new(),
+            new_contact_notes: String::new(),
+            history_filter: HistoryFilter::All,
+            log_filter: LogFilter::All,
+            selected_log_index: None,
+            status_toast: None,
+            started_at: Instant::now(),
+            last_tab: active_tab,
+            tab_anim_start: Instant::now(),
+            tab_from_right: true,
+            remote_config: Some(remote_config),
         }
     }
 
@@ -231,7 +298,18 @@ impl eframe::App for RustSipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        self.drain_completed_calls();
+        // F1 (--remote): recopia o config espelho (contatos/histórico/conta),
+        // que a thread de IPC mantém atualizado a partir do daemon. No modo
+        // local (remote_config None) nada muda.
+        if let Some(ref rc) = self.remote_config {
+            if let Ok(cfg) = rc.lock() {
+                self.config = cfg.clone();
+            }
+            // No modo remoto o daemon é o dono do config/histórico — a janela
+            // NÃO drena nem salva local (evita escrever o disco local).
+        } else {
+            self.drain_completed_calls();
+        }
 
         let reg_status = self
             .sip

@@ -247,6 +247,14 @@ impl AudioEngine {
         }
     }
 
+    /// Envolve um `AudioSharedState` EXISTENTE sem abrir dispositivo algum. Usado
+    /// no modo `--remote` (F1): a janela lê os níveis de VU/flags deste espelho,
+    /// que a thread de IPC preenche a partir das `ServerMsg::Hot`/`Flags`. O
+    /// daemon é o dono do áudio real — aqui nenhum PipeWire/pactl é tocado.
+    pub fn from_state(state: Arc<AudioSharedState>) -> Self {
+        Self { state }
+    }
+
     /// Lista todos os microfones reais do PipeWire / PulseAudio (ignorando monitores de saída)
     pub fn list_input_devices() -> Vec<AudioDeviceInfo> {
         let default_source = get_pactl_default("get-default-source");
