@@ -79,7 +79,7 @@ cargo test
 ## ⚙️ Configuração
 
 Ao abrir o RustSIP, acesse a aba **Conta**:
-1. **Endereço do Servidor:** IP ou domínio do seu servidor FreeSWITCH / PBX (ex: `voipotimizar.otimizartecnologia.com.br`).
+1. **Endereço do Servidor:** IP ou domínio do seu servidor FreeSWITCH / PBX (ex: `servidorsip.minhaempresa.com.br`).
 2. **Usuário / Ramal:** Seu número de ramal (ex: `2003`).
 3. **Senha SIP:** Sua senha do ramal.
 4. **Transporte:** Selecione **UDP** ou **TCP** conforme a porta configurada no seu servidor.
