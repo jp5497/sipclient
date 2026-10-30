@@ -282,14 +282,16 @@ impl eframe::App for RustSipApp {
         if let Ok(cfg) = self.remote_config.lock() {
             self.config.contacts = cfg.contacts.clone();
             self.config.history = cfg.history.clone();
-            if cfg.account != self.prev_mirror_account {
-                self.config.account = cfg.account.clone();
-                self.prev_mirror_account = cfg.account.clone();
-            }
-            if cfg.audio != self.prev_mirror_audio {
-                self.config.audio = cfg.audio.clone();
-                self.prev_mirror_audio = cfg.audio.clone();
-            }
+            crate::config::apply_if_changed(
+                &mut self.config.account,
+                &cfg.account,
+                &mut self.prev_mirror_account,
+            );
+            crate::config::apply_if_changed(
+                &mut self.config.audio,
+                &cfg.audio,
+                &mut self.prev_mirror_audio,
+            );
             self.config.password_needs_reentry = cfg.password_needs_reentry;
         }
 

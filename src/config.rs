@@ -136,6 +136,49 @@ pub struct Contact {
     pub notes: String,
 }
 
+/// Monta um `Contact` validando/normalizando os campos, com o `id` fornecido
+/// pelo chamador (o daemon gera o id a partir do relógio — manter a geração do
+/// id FORA desta função a torna pura e testável). Regra atual: `name` e
+/// `number` são trimados e, se qualquer um ficar vazio, o contato é rejeitado
+/// (`None`); `notes` é trimado. Fonte única usada pelo handler `AddContact`.
+pub fn build_contact(name: &str, number: &str, notes: &str, id: String) -> Option<Contact> {
+    let name = name.trim().to_string();
+    let number = number.trim().to_string();
+    if name.is_empty() || number.is_empty() {
+        return None;
+    }
+    Some(Contact {
+        id,
+        name,
+        number,
+        notes: notes.trim().to_string(),
+    })
+}
+
+/// Remove da lista o contato cujo `id` casa, preservando os demais. Retorna
+/// `true` se removeu algo (o daemon só faz broadcast quando mudou). Fonte única
+/// usada pelo handler `DeleteContact`.
+pub fn remove_contact(contacts: &mut Vec<Contact>, id: &str) -> bool {
+    let before = contacts.len();
+    contacts.retain(|ct| ct.id != id);
+    contacts.len() != before
+}
+
+/// Cópia edge-triggered de um campo-espelho (conta/áudio na janela remota):
+/// aplica `incoming` sobre `current` e atualiza `prev` SOMENTE quando o valor
+/// vindo do daemon mudou em relação ao último visto. Retorna `true` quando
+/// aplicou. Mantém o formulário do usuário intacto entre mudanças do daemon
+/// (ver `prev_mirror_*` em `ui.rs`).
+pub fn apply_if_changed<T: Clone + PartialEq>(current: &mut T, incoming: &T, prev: &mut T) -> bool {
+    if incoming != prev {
+        *current = incoming.clone();
+        *prev = incoming.clone();
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallDirection {
     Outgoing,
@@ -381,5 +424,77 @@ mod tests {
     fn test_empty_password_no_flag_writes_empty() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.persisted_password_field(anchor()), "");
+    }
+
+    // --- B3 (gate F2): lógica de comando de contatos e edge-trigger, testada
+    // SEM tocar o ~/.config real (funções puras extraídas de daemon/ui). ---
+
+    fn ct(id: &str) -> Contact {
+        Contact {
+            id: id.to_string(),
+            name: format!("nome-{id}"),
+            number: format!("55{id}"),
+            notes: String::new(),
+        }
+    }
+
+    /// DeleteContact: remove exatamente o id pedido, preserva os outros, e
+    /// retorna true só quando removeu algo.
+    #[test]
+    fn test_remove_contact_by_id() {
+        let mut list = vec![ct("a"), ct("b"), ct("c")];
+
+        assert!(remove_contact(&mut list, "b"), "remover id existente => true");
+        assert_eq!(
+            list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "mantém os demais na ordem, remove só o 'b'"
+        );
+
+        // id inexistente: lista intacta, retorna false (daemon não faz broadcast).
+        assert!(!remove_contact(&mut list, "zzz"), "id ausente => false");
+        assert_eq!(list.len(), 2);
+    }
+
+    /// AddContact: gera o contato com o id dado, trima os campos, e REJEITA
+    /// quando name OU number ficam vazios após o trim.
+    #[test]
+    fn test_build_contact_validates_and_normalizes() {
+        // Feliz: trima name/number/notes, usa o id fornecido.
+        let c = build_contact("  Alice  ", "  1001 ", "  vip ", "id1".into())
+            .expect("name+number não-vazios => Some");
+        assert_eq!(c.id, "id1");
+        assert_eq!(c.name, "Alice");
+        assert_eq!(c.number, "1001");
+        assert_eq!(c.notes, "vip");
+
+        // name vazio (ou só espaços) => rejeita.
+        assert!(build_contact("   ", "1001", "", "id2".into()).is_none());
+        // number vazio => rejeita.
+        assert!(build_contact("Bob", "  ", "", "id3".into()).is_none());
+        // ambos vazios => rejeita.
+        assert!(build_contact("", "", "", "id4".into()).is_none());
+    }
+
+    /// Edge-trigger do espelho (prev_mirror_*): só "aplica" quando o valor
+    /// mudou; não aplica (nem mexe no current) quando é igual ao último visto.
+    #[test]
+    fn test_apply_if_changed_edge_trigger() {
+        // Começa alinhado: current == prev == incoming => não aplica.
+        let mut current = 1u32;
+        let mut prev = 1u32;
+        assert!(!apply_if_changed(&mut current, &1, &mut prev), "igual => não aplica");
+        assert_eq!((current, prev), (1, 1));
+
+        // Daemon mudou o valor (incoming != prev): aplica uma vez e atualiza prev.
+        assert!(apply_if_changed(&mut current, &2, &mut prev), "mudou => aplica");
+        assert_eq!((current, prev), (2, 2));
+
+        // Mesmo incoming de novo (já visto): não reaplica, mesmo que o usuário
+        // tenha editado o `current` no meio-tempo (formulário preservado).
+        current = 99; // simula edição local do formulário
+        assert!(!apply_if_changed(&mut current, &2, &mut prev), "já visto => não reaplica");
+        assert_eq!(current, 99, "não sobrescreve a edição local do usuário");
+        assert_eq!(prev, 2);
     }
 }

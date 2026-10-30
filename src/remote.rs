@@ -228,6 +228,15 @@ pub struct WindowControl {
     /// Há bandeja (SNI) no ambiente (vem do `Welcome.tray_available`). Decide o
     /// comportamento de FECHAR a janela: com tray, só encerra a janela; sem
     /// tray, encerra o daemon também (ClientMsg::Quit).
+    ///
+    /// L2 (gate F3): o default é `true` ANTES do Welcome chegar (ver `new()`).
+    /// Trade-off: existe uma janela de milissegundos entre a janela subir e o
+    /// Welcome informar o valor real em que, se houver bandeja, um fechar
+    /// nesse instante assumiria `true` corretamente, mas se NÃO houver bandeja
+    /// o fechar não mandaria `Quit` e deixaria o daemon órfão. Aceitável porque
+    /// (a) o Welcome chega logo após o connect (handshake local no socket), e
+    /// (b) o default errar para `true` é o lado seguro: nunca derruba o daemon
+    /// por engano num fechar prematuro — no máximo adia o `Quit` por um frame.
     pub tray_available: std::sync::atomic::AtomicBool,
     /// F3 (M1): o usuário pediu para encerrar (fechou a janela sem tray → Quit,
     /// ou está fechando de propósito). Um EOF no socket DEPOIS disto é um

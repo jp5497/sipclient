@@ -491,6 +491,7 @@ async fn run_inner() -> Result<()> {
         daemon_pid: std::process::id(),
         client_count: client_count.clone(),
         evt_tx: evt_tx.clone(),
+        save_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
     match ipc_server.bind(&sock_path).await {
         Ok(listener) => {
@@ -806,6 +807,13 @@ struct IpcServer {
     /// aqui para disparar o encerramento gracioso no loop principal (fallback
     /// sem tray: a janela fecha e pede ao daemon que também encerre).
     evt_tx: tokio::sync::mpsc::UnboundedSender<DaemonEvt>,
+    /// B2 (gate F2): serializa os `config.save()` da via quente (`mutate_config`).
+    /// O save é I/O + cifra + fsync + rename; roda em `spawn_blocking` para não
+    /// bloquear um worker do runtime a cada evento (ex. cada 'changed' do slider
+    /// de volume). Este mutex ASSÍNCRONO ordena os saves entre si — necessário
+    /// porque `write_atomic` usa um tmp por-PID (`.config.json.tmp.{pid}`): dois
+    /// saves concorrentes do MESMO processo colidiriam no `create_new`.
+    save_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IpcServer {
@@ -1156,24 +1164,17 @@ impl IpcServer {
                 }
             }
             ClientMsg::AddContact { name, number, notes } => {
-                let name = name.trim().to_string();
-                let number = number.trim().to_string();
-                if name.is_empty() || number.is_empty() {
-                    return;
-                }
-                let notes = notes.trim().to_string();
                 let id = format!("{}", chrono::Local::now().timestamp_millis());
-                self.mutate_config(|c| {
-                    c.contacts.push(crate::config::Contact { id: id.clone(), name: name.clone(), number: number.clone(), notes: notes.clone() });
-                });
+                let Some(contact) = crate::config::build_contact(&name, &number, &notes, id) else {
+                    return;
+                };
+                self.mutate_config(|c| c.contacts.push(contact.clone()));
                 self.broadcast_contacts();
             }
             ClientMsg::DeleteContact(id) => {
                 let mut removed = false;
                 self.mutate_config(|c| {
-                    let before = c.contacts.len();
-                    c.contacts.retain(|ct| ct.id != id);
-                    removed = c.contacts.len() != before;
+                    removed = crate::config::remove_contact(&mut c.contacts, &id);
                 });
                 if removed {
                     self.broadcast_contacts();
@@ -1210,12 +1211,27 @@ impl IpcServer {
         (cfg.audio.input_device.clone(), cfg.audio.output_device.clone())
     }
 
-    /// Muta o config sob lock E persiste (o daemon é o único writer). O save é
-    /// feito com o lock ainda SEGURO para serializar o estado consistente.
+    /// Muta o config sob lock E persiste (o daemon é o único writer). B2: o
+    /// save (I/O + cifra + fsync + rename) NÃO roda mais no worker async — sob o
+    /// lock só mutamos e clonamos o snapshot; o lock é solto e o save vai para
+    /// `spawn_blocking`, serializado pelo `save_gate` (ver o campo). Assim um
+    /// stream de eventos rápidos (slider de volume) não prende um worker do
+    /// runtime a cada 'changed'. A ordem dos saves é preservada pelo gate; a
+    /// cópia em memória do config (a fonte de verdade in-process) já reflete a
+    /// mutação assim que esta função retorna.
     fn mutate_config(&self, f: impl FnOnce(&mut AppConfig)) {
-        let mut cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
-        f(&mut cfg);
-        cfg.save();
+        let snapshot = {
+            let mut cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+            f(&mut cfg);
+            cfg.clone()
+        };
+        let gate = self.save_gate.clone();
+        tokio::spawn(async move {
+            // Serializa contra outros saves (tmp por-PID em write_atomic) e
+            // move o I/O bloqueante para fora do pool async.
+            let _guard = gate.lock().await;
+            let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
+        });
     }
 
     /// Broadcast do frame de seção de ÁUDIO (gain/volume/device) a todos os
