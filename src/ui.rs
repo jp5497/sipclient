@@ -101,6 +101,15 @@ pub struct RustSipApp {
     remote_config: crate::remote::RemoteConfig,
     client: crate::remote::DaemonClient,
 
+    // F3: sinais de controle do daemon (Raise/Shutdown/tray_available) + ctx
+    // para a thread de IPC acordar a janela. A UI thread é a única que fala com
+    // o viewport do egui, então ela POLLA estes flags por frame e age.
+    control: std::sync::Arc<crate::remote::WindowControl>,
+    // F3: true depois que já pedimos o fechamento do viewport (Shutdown ou
+    // fallback sem tray), para não reenviar Close/Quit a cada frame enquanto o
+    // egui processa o fechamento.
+    closing: bool,
+
     // L6: a conta e o áudio são FORMULÁRIO (o usuário digita/arrasta em
     // `self.config.account`/`self.config.audio`). Copiar o espelho inteiro a
     // cada tick apagaria o que ele está digitando. Então só puxamos conta/áudio
@@ -126,6 +135,7 @@ impl RustSipApp {
         audio_state: std::sync::Arc<crate::audio::AudioSharedState>,
         remote_config: crate::remote::RemoteConfig,
         client: crate::remote::DaemonClient,
+        control: std::sync::Arc<crate::remote::WindowControl>,
     ) -> Self {
         theme::configure_style(&cc.egui_ctx);
 
@@ -178,6 +188,8 @@ impl RustSipApp {
             tab_from_right: true,
             remote_config,
             client,
+            control,
+            closing: false,
             prev_mirror_account: config_account_snapshot,
             prev_mirror_audio: config_audio_snapshot,
         }
@@ -212,6 +224,46 @@ impl RustSipApp {
 impl eframe::App for RustSipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
+
+        // F3 — sinais de controle do daemon (polling por frame; os flags são
+        // setados pela thread de IPC, que também pede repaint para acordar aqui).
+        //
+        // (a) Shutdown (item 4): o daemon vai encerrar. Fecha a janela de
+        //     verdade. `closing` evita reenviar Close a cada frame.
+        if self.control.shutdown.load(std::sync::atomic::Ordering::Relaxed) && !self.closing {
+            self.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // (b) Raise (item 2): tray "Mostrar" com janela viva, ou auto-show de
+        //     chamada entrando. Traz à frente. No Wayland o Focus pode ser
+        //     barrado pelo anti-foco do KWin (a janela só pisca na barra) — é
+        //     limite de plataforma; RequestUserAttention é a mitigação. Visible
+        //     é defensivo (o modelo não oculta a janela, mas não custa garantir).
+        if self.control.raise.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
+        // (c) Fallback sem tray (item 5): se NÃO há bandeja, fechar a janela
+        //     deve encerrar o daemon também (senão o app fica inacessível em
+        //     background). Detecta o pedido de fechar do WM/usuário e, sem tray,
+        //     manda Quit ao daemon ANTES de deixar o viewport fechar. Com tray,
+        //     fechar só encerra o processo-janela (o daemon segue vivo).
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
+            let has_tray = self
+                .control
+                .tray_available
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !has_tray {
+                self.closing = true;
+                self.client.send(ClientMsg::Quit);
+            }
+            // Em ambos os casos deixamos o fechamento do viewport prosseguir
+            // (não cancelamos). Sem tray, o Quit derruba o daemon; com tray, o
+            // daemon permanece e o tray reabre a janela depois.
+        }
 
         // F2: a janela é cliente do daemon. Recopia do espelho (mantido pela
         // thread de IPC) a cada frame, com cuidado para não apagar o FORMULÁRIO:
@@ -309,6 +361,48 @@ impl eframe::App for RustSipApp {
                         ui.set_opacity(a);
                         ctx.request_repaint(); // mantém o fade fluido até completar
                     }
+                }
+                // F3 (item 7): banner de serviço caído. O supervisor de IPC
+                // (remote.rs) marca `broken` no EOF/erro do socket e, em
+                // paralelo, tenta reconectar a cada 1s (respawnando o daemon uma
+                // vez por tentativa via ensure_daemon). Aqui só REFLETIMOS o
+                // estado — reusa o visual de card/toast do tema, sem componente
+                // novo. Enquanto `broken`, pedimos repaint para o banner sumir
+                // assim que a reconexão limpar o flag.
+                if self.client.is_broken() {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    egui::Frame::NONE
+                        .fill(BG_CARD)
+                        .stroke(Stroke::new(1.0_f32, STATUS_AMBER))
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                paint_icon(
+                                    ui.painter(),
+                                    Icon::Refresh,
+                                    ui.cursor().min + Vec2::new(6.0, 7.0),
+                                    12.0,
+                                    STATUS_AMBER,
+                                );
+                                ui.add_space(14.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("Serviço RustSIP parado — reconectando…")
+                                            .font(font_bold(FS_LABEL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Se persistir, veja ~/.config/rustsip/daemon.log",
+                                        )
+                                        .font(font(FS_MICRO))
+                                        .color(TEXT_MUTED),
+                                    );
+                                });
+                            });
+                        });
+                    ui.add_space(6.0);
                 }
                 // Toast discreto de notificação
                 if let Some((ref msg, ts)) = self.status_toast {

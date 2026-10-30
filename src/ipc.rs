@@ -93,6 +93,21 @@ pub enum ClientMsg {
     DeleteContact(String),
     /// Limpa o histórico, grava e emite `History`.
     ClearHistory,
+
+    // --- Encerramento (F3) ---
+    /// Pede ao daemon que ENCERRE (shutdown gracioso: Hangup + un-REGISTER +
+    /// stop_audio). Enviado pela janela quando ela fecha E não há bandeja
+    /// (`tray_available == false`): sem ícone, deixar o daemon vivo em segundo
+    /// plano tornaria o app inacessível. Com bandeja, fechar a janela NÃO manda
+    /// isto (o daemon segue vivo, acessível pelo tray).
+    Quit,
+
+    /// Pede ao daemon o MESMO comportamento do tray "Mostrar" (F3, item 3): uma
+    /// 2ª instância da janela (bloqueada pelo gui.lock) conecta só para disparar
+    /// isto e SAI — o daemon faz broadcast de `Raise` à janela já aberta, que se
+    /// traz à frente. Evita abrir uma 2ª janela quando "Mostrar" é acionado com
+    /// uma já visível.
+    RequestShow,
 }
 
 /// Mensagens SERVIDOR -> CLIENTE.
@@ -108,10 +123,10 @@ pub enum ClientMsg {
 ///
 /// `Contacts`/`History` são emitidas logo após o `Welcome` no connect (L1: o
 /// Welcome vai sem essas listas para não estourar o teto de 256 KiB com muitos
-/// itens) e também na F2+ quando mudarem. As variantes `AudioCfg`/`Account`/
-/// `Raise`/`Shutdown` fazem parte do contrato mas só são EMITIDAS a partir da
-/// F2/F3 — declaradas aqui para estabilidade do protocolo, com
-/// `#[allow(dead_code)]` onde o construtor ainda não é exercido.
+/// itens) e também na F2+ quando mudarem. As variantes `AudioCfg`/`Account`
+/// são emitidas desde a F2; `Raise`/`Shutdown` são emitidas na F3 (tray
+/// "Mostrar"/"Sair"): `Raise` quando o daemon pede à janela que se traga à
+/// frente, `Shutdown` quando o daemon vai encerrar e a janela deve fechar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", content = "c")]
 // Welcome é grande (snapshot completo) e as demais variantes pequenas; boxear
@@ -165,10 +180,8 @@ pub enum ServerMsg {
     /// aplica o formulário de conta quando ESTE frame chega (não a cada tick).
     Account(SipAccountConfig),
     /// Pedido do daemon para a janela se trazer à frente (F3, tray "Mostrar").
-    #[allow(dead_code)]
     Raise,
     /// Daemon vai encerrar; a janela deve fechar (F3).
-    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -447,6 +460,8 @@ mod tests {
             },
             ClientMsg::DeleteContact("c1".into()),
             ClientMsg::ClearHistory,
+            ClientMsg::Quit,
+            ClientMsg::RequestShow,
         ];
         for m in msgs {
             let mut buf = Vec::new();

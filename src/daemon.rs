@@ -23,9 +23,9 @@ use chrono::Local;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -201,6 +201,55 @@ extern "C" {
 /// Carimbo de tempo para as linhas de log do daemon.
 fn ts() -> String {
     Local::now().format("%d/%m/%Y %H:%M:%S%.3f").to_string()
+}
+
+/// Janela mínima entre dois relances de janela disparados pelo daemon. Protege
+/// contra duplo-clique no tray e contra re-relance em loop no auto-show de
+/// chamada entrando (o tray pode reemitir `activate`; o `Incoming` persiste por
+/// vários ticks). Um relance dentro desta janela é IGNORADO.
+const RELAUNCH_GUARD: Duration = Duration::from_secs(5);
+
+/// Relança a JANELA CLIENTE como processo FILHO do daemon. É o mesmo binário
+/// SEM argumento (o default de `main` = "garante daemon + abre janela cliente";
+/// o daemon já está de pé, então só a janela sobe e conecta ao socket).
+///
+/// Hardening (espelha o spawn do daemon na F2): `stdin(null)` solta a entrada
+/// controladora e o `wait()` numa thread detached faz o reap para a janela não
+/// virar zumbi se morrer antes do daemon. A janela PODE herdar o grupo de
+/// processos do daemon (é filha dele, não o contrário), então NÃO forçamos
+/// `process_group(0)` aqui — o que importa é não virar zumbi e não prender stdin.
+///
+/// `current_exe()` pode falhar (ex. o binário foi removido/substituído); nesse
+/// caso NÃO fazemos unwrap — logamos e desistimos do relance (o usuário ainda
+/// tem o tray). Retorna `true` se o spawn foi disparado.
+fn spawn_window() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[{}] [daemon] relance da janela abortado: current_exe falhou ({e})", ts());
+            return false;
+        }
+    };
+    match std::process::Command::new(exe)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            std::thread::Builder::new()
+                .name("rustsip-window-reaper".to_string())
+                .spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                })
+                .ok();
+            println!("[{}] [daemon] janela cliente relançada", ts());
+            true
+        }
+        Err(e) => {
+            println!("[{}] [daemon] relance da janela falhou ({e})", ts());
+            false
+        }
+    }
 }
 
 /// Ponto de entrada do modo daemon, chamado pelo `main` quando o 1º arg é
@@ -395,6 +444,10 @@ async fn run_inner() -> Result<()> {
     // config (Lagged), que o Welcome/próxima mudança reconcilia. NÃO vai o
     // AppConfig inteiro, só a seção afetada (senão sobrescreve formulário aberto).
     let (cfg_tx, _cfg_rx0) = tokio::sync::broadcast::channel::<ServerMsg>(64);
+    // F3: contador de clientes-janela vivos. O servidor IPC incrementa após o
+    // Hello e decrementa quando a conexão cai; o loop principal lê para escolher
+    // entre Raise (broadcast) e relançar a janela.
+    let client_count = Arc::new(AtomicUsize::new(0));
     let ipc_server = IpcServer {
         sip: sip.clone(),
         audio: audio.clone(),
@@ -404,6 +457,8 @@ async fn run_inner() -> Result<()> {
         cfg_tx: cfg_tx.clone(),
         tray_available,
         daemon_pid: std::process::id(),
+        client_count: client_count.clone(),
+        evt_tx: evt_tx.clone(),
     };
     match ipc_server.bind(&sock_path).await {
         Ok(listener) => {
@@ -425,6 +480,15 @@ async fn run_inner() -> Result<()> {
 
     // Drena o histórico periodicamente (o daemon é o único writer do config).
     let mut drain_tick = tokio::time::interval(Duration::from_secs(2));
+    // F3: tick rápido para detectar a BORDA de subida para CallPhase::Incoming e
+    // auto-mostrar a janela (relançar se não houver nenhuma). 250ms: rápido o
+    // bastante para a janela surgir junto do ringtone, barato o bastante (só lê
+    // o Mutex da fase).
+    let mut incoming_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut prev_incoming = false;
+    // F3: instante do último relance de janela disparado pelo daemon (guarda
+    // anti duplo-clique / anti-loop do auto-show). `None` = nunca relançou.
+    let mut last_relaunch: Option<Instant> = None;
 
     println!("[{}] [daemon] loop principal pronto", ts());
     loop {
@@ -432,11 +496,51 @@ async fn run_inner() -> Result<()> {
             _ = drain_tick.tick() => {
                 drain_completed_calls(&state, &config, &cfg_tx);
             }
+            _ = incoming_tick.tick() => {
+                // Auto-show em chamada entrando (item 6). Dispara só na borda de
+                // subida Idle/outro -> Incoming, não a cada tick enquanto toca.
+                let is_incoming = matches!(
+                    state.call_phase.lock().map(|p| p.clone()),
+                    Ok(CallPhase::Incoming { .. })
+                );
+                if is_incoming && !prev_incoming {
+                    if client_count.load(Ordering::Relaxed) > 0 {
+                        // Há janela: só traz à frente.
+                        println!("[{}] [daemon] chamada entrando: Raise à janela", ts());
+                        let _ = cfg_tx.send(ServerMsg::Raise);
+                    } else {
+                        // Sem janela: relança (respeitando a guarda anti-loop).
+                        let can = last_relaunch.is_none_or(|t| t.elapsed() >= RELAUNCH_GUARD);
+                        if can {
+                            println!("[{}] [daemon] chamada entrando: relançando janela", ts());
+                            if spawn_window() {
+                                last_relaunch = Some(Instant::now());
+                            }
+                        }
+                    }
+                }
+                prev_incoming = is_incoming;
+            }
             Some(evt) = evt_rx.recv() => {
                 match evt {
                     DaemonEvt::Show => {
-                        // F1 abrirá a janela via socket; F0 só registra a intenção.
-                        println!("[{}] [daemon] show requested", ts());
+                        // Item 1: se há janela cliente conectada, pede Raise por
+                        // broadcast; senão, relança a janela (default = cliente).
+                        if client_count.load(Ordering::Relaxed) > 0 {
+                            println!("[{}] [daemon] 'Mostrar': Raise à janela existente", ts());
+                            let _ = cfg_tx.send(ServerMsg::Raise);
+                        } else {
+                            // Guarda anti duplo-clique: ignora se relançou há pouco.
+                            let can = last_relaunch.is_none_or(|t| t.elapsed() >= RELAUNCH_GUARD);
+                            if can {
+                                println!("[{}] [daemon] 'Mostrar': relançando janela", ts());
+                                if spawn_window() {
+                                    last_relaunch = Some(Instant::now());
+                                }
+                            } else {
+                                println!("[{}] [daemon] 'Mostrar' ignorado (relance recente)", ts());
+                            }
+                        }
                     }
                     DaemonEvt::Quit => {
                         println!("[{}] [daemon] 'Sair' solicitado", ts());
@@ -458,6 +562,11 @@ async fn run_inner() -> Result<()> {
         }
     }
 
+    // F3 (item 4): antes de derrubar o SIP, avisa as janelas que o daemon vai
+    // encerrar — elas fecham de verdade ao receber Shutdown. Broadcast é no-op
+    // se não há cliente. Feito ANTES do graceful_shutdown para a janela sair
+    // junto (e não ficar pendurada tentando reconectar a um socket que já foi).
+    let _ = cfg_tx.send(ServerMsg::Shutdown);
     graceful_shutdown(&sip, &state, &audio, &config, &cfg_tx).await;
     // Remove o socket IPC (best-effort) para não deixar um arquivo órfão.
     let _ = std::fs::remove_file(&sock_path);
@@ -633,6 +742,15 @@ struct IpcServer {
     cfg_tx: tokio::sync::broadcast::Sender<ServerMsg>,
     tray_available: bool,
     daemon_pid: u32,
+    /// Nº de clientes-janela conectados AGORA (incrementado após o Hello, zerado
+    /// quando a conexão cai, via guarda RAII). O loop principal lê este contador
+    /// para decidir, no "Mostrar"/auto-show, entre BROADCAST de `Raise` (há
+    /// janela viva) e RELANÇAR a janela (não há nenhuma).
+    client_count: Arc<AtomicUsize>,
+    /// Canal bandeja/comando -> núcleo. `apply_command(Quit)` manda `Quit` por
+    /// aqui para disparar o encerramento gracioso no loop principal (fallback
+    /// sem tray: a janela fecha e pede ao daemon que também encerre).
+    evt_tx: tokio::sync::mpsc::UnboundedSender<DaemonEvt>,
 }
 
 impl IpcServer {
@@ -742,6 +860,19 @@ impl IpcServer {
         let stale_exe = daemon_exe_mtime()
             .map(|d| d != client_mtime && client_mtime != 0)
             .unwrap_or(false);
+
+        // F3: a partir daqui há um cliente-janela VIVO. Conta-o com uma guarda
+        // RAII: incrementa agora e decrementa quando `handle_conn` retornar (por
+        // qualquer caminho — EOF, erro de escrita, abort). O loop principal lê
+        // este contador para escolher Raise vs. relançar.
+        struct ClientGuard(Arc<AtomicUsize>);
+        impl Drop for ClientGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _client_guard = ClientGuard(self.client_count.clone());
+        self.client_count.fetch_add(1, Ordering::Relaxed);
 
         let (log_seq_at_snapshot, backlog) = self.log_snapshot();
         let (welcome, contacts, history) = self.build_welcome(stale_exe, log_seq_at_snapshot);
@@ -996,6 +1127,24 @@ impl IpcServer {
             ClientMsg::ClearHistory => {
                 self.mutate_config(|c| c.history.clear());
                 self.broadcast_history();
+            }
+            ClientMsg::Quit => {
+                // Fallback sem tray (item 5): a janela fechou e pediu que o
+                // daemon também encerre. Sinaliza o loop principal, que faz o
+                // shutdown gracioso (Hangup + un-REGISTER + stop_audio) e o
+                // broadcast de Shutdown. NÃO encerramos aqui (este é só o
+                // handler de comando de uma conexão) para passar pelo MESMO
+                // caminho de "Sair"/SIGTERM. Se o canal já caiu (daemon
+                // encerrando), o send falha silenciosamente — já está indo.
+                println!("[{}] [daemon] IPC: Quit recebido da janela; encerrando", ts());
+                let _ = self.evt_tx.send(DaemonEvt::Quit);
+            }
+            ClientMsg::RequestShow => {
+                // Item 3: 2ª instância pediu "Mostrar". Reusa o caminho do tray
+                // (DaemonEvt::Show) — com janela(s) viva(s) vira broadcast de
+                // Raise à(s) existente(s). A 2ª instância sai logo após enviar.
+                println!("[{}] [daemon] IPC: RequestShow recebido", ts());
+                let _ = self.evt_tx.send(DaemonEvt::Show);
             }
         }
     }
