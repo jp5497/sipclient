@@ -236,9 +236,14 @@ pub fn run() -> Result<()> {
 
     let result = rt.block_on(run_inner());
 
-    // Mantém o lock vivo explicitamente até aqui.
+    // NÃO apagar o lockfile. O flock é solto automaticamente quando o fd
+    // (`lock_file`) fecha no drop ao fim do processo; o arquivo vazio em tmpfs
+    // não custa nada. Apagar o caminho abriria a corrida clássica do flock: A
+    // solta o lock e remove o path, B já travou o inode antigo, e C cria um
+    // inode novo no mesmo caminho e trava sem conflito -> B e C rodam juntas
+    // (duplo REGISTER + dois writers do config). Mantendo o arquivo, o lock
+    // vive porque o fd vive, e uma 2ª instância sempre colide no mesmo inode.
     drop(lock_file);
-    let _ = std::fs::remove_file(&lock_path);
     result
 }
 
@@ -258,6 +263,20 @@ async fn run_inner() -> Result<()> {
     }
     let sip = SipController::new(audio.clone());
     let state = sip.state.clone();
+
+    // Sinais instalados ANTES de qualquer REGISTER (auto_connect abaixo):
+    // SIGTERM/SIGINT => Sair gracioso; SIGHUP ignorado. Se instalados DEPOIS do
+    // Connect, um SIGTERM na janela entre o REGISTER e a instalação teria ação
+    // padrão e mataria o processo SEM un-REGISTER (caso real: systemd/script
+    // dando stop logo após start; a janela podia chegar a ~25s se o watcher
+    // D-Bus travasse no register do ksni). tokio permite recv() mais tarde, no
+    // loop principal — só a INSTALAÇÃO precisa vir cedo.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("instalar handler SIGTERM")?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("instalar handler SIGINT")?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("instalar handler SIGHUP")?;
 
     // auto_connect: dispara REGISTER no boot, igual o ui.rs faz no new.
     {
@@ -312,7 +331,6 @@ async fn run_inner() -> Result<()> {
             }
         }
     };
-    let _ = tray_available;
 
     // --- Servidor IPC (F1): expõe o estado por socket Unix para a janela ---
     // Remove socket órfão antes do bind; o diretório 0700 já existe (runtime_dir
@@ -341,13 +359,8 @@ async fn run_inner() -> Result<()> {
         }
     }
 
-    // Sinais: SIGTERM/SIGINT => Sair gracioso; SIGHUP ignorado.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("instalar handler SIGTERM")?;
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("instalar handler SIGINT")?;
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("instalar handler SIGHUP")?;
+    // Sinais já foram instalados no início de run_inner (antes do auto_connect),
+    // para fechar a janela em que um SIGTERM mataria o processo sem un-REGISTER.
 
     // Drena o histórico periodicamente (o daemon é o único writer do config).
     let mut drain_tick = tokio::time::interval(Duration::from_secs(2));
@@ -455,19 +468,31 @@ async fn graceful_shutdown(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let was_registered = matches!(
+    // Manda Disconnect SEMPRE que o estado NÃO for Disconnected — não só em
+    // Registered|Connecting. Um re-REGISTER sem resposta (sip.rs:1034) ou um
+    // 401/403/4xx (sip.rs ~1197-1210) seta Failed(..) SEM sair do loop da
+    // sessão, então o binding segue válido no PBX e precisa do un-REGISTER.
+    // É seguro mesmo sem sessão viva: o run_sip_supervisor (sip.rs:778)
+    // descarta comandos != Connect, então o Disconnect vira no-op (pior caso:
+    // espera os 2s do timeout abaixo).
+    let needs_unregister = !matches!(
         state.reg_status.lock().map(|s| s.clone()),
-        Ok(RegistrationStatus::Registered) | Ok(RegistrationStatus::Connecting)
+        Ok(RegistrationStatus::Disconnected)
     );
-    if was_registered {
+    if needs_unregister {
         println!("[{}] [daemon] un-REGISTER (Disconnect), timeout 2s", ts());
         sip.send(SipCommand::Disconnect);
-        // Aguarda até 2s o estado virar Disconnected.
+        // Aguarda até 2s o estado virar Disconnected — e SÓ Disconnected. O
+        // handler de Disconnect (sip.rs ~1660) só seta Disconnected DEPOIS de
+        // mandar o REGISTER Expires:0 e esperar 120ms, então esperar por
+        // Disconnected garante que o un-REGISTER saiu. Aceitar Failed(_) aqui
+        // encerraria a espera ANTES do Expires:0 sair (um Failed que chegue
+        // durante a janela), deixando o binding pendurado.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let done = matches!(
                 state.reg_status.lock().map(|s| s.clone()),
-                Ok(RegistrationStatus::Disconnected) | Ok(RegistrationStatus::Failed(_))
+                Ok(RegistrationStatus::Disconnected)
             );
             if done {
                 println!("[{}] [daemon] un-REGISTER concluído", ts());

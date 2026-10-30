@@ -18,8 +18,11 @@ fn main() -> eframe::Result<()> {
     // headless com bandeja; `rustsip --remote` (ou `remote`) abre a janela em
     // modo CLIENTE lendo o estado do daemon por socket (F1, read-only); qualquer
     // outro caso (default) roda EXATAMENTE a janela de hoje, inalterada.
-    let arg1 = std::env::args().nth(1);
-    if arg1.as_deref() == Some("daemon") {
+    // args_os (não args): std::env::args() faz PANIC se algum argumento não for
+    // UTF-8. O dispatch só compara o 1º arg com literais ASCII, então comparar
+    // o OsStr cru evita o panic de borda sem mudar o comportamento.
+    let arg1 = std::env::args_os().nth(1);
+    if arg1.as_deref() == Some(std::ffi::OsStr::new("daemon")) {
         if let Err(e) = daemon::run() {
             eprintln!("rustsip daemon: erro fatal: {e:#}");
             std::process::exit(1);
@@ -27,7 +30,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    if matches!(arg1.as_deref(), Some("--remote") | Some("remote")) {
+    if matches!(
+        arg1.as_deref(),
+        Some(a) if a == std::ffi::OsStr::new("--remote") || a == std::ffi::OsStr::new("remote")
+    ) {
         return remote::run_remote_window();
     }
 
