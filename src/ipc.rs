@@ -48,10 +48,12 @@ pub enum ClientMsg {
 /// recusa um newtype cujo conteúdo não serializa como mapa (Option/Vec/
 /// primitivo) — a adjacente põe o payload sob `c` e aceita qualquer tipo.
 ///
-/// As variantes `AudioCfg`/`Contacts`/`History`/`Account`/`Raise`/`Shutdown`
-/// fazem parte do contrato mas só são EMITIDAS a partir da F2/F3 — declaradas
-/// aqui para estabilidade do protocolo, com `#[allow(dead_code)]` onde o
-/// construtor ainda não é exercido.
+/// `Contacts`/`History` são emitidas logo após o `Welcome` no connect (L1: o
+/// Welcome vai sem essas listas para não estourar o teto de 256 KiB com muitos
+/// itens) e também na F2+ quando mudarem. As variantes `AudioCfg`/`Account`/
+/// `Raise`/`Shutdown` fazem parte do contrato mas só são EMITIDAS a partir da
+/// F2/F3 — declaradas aqui para estabilidade do protocolo, com
+/// `#[allow(dead_code)]` onde o construtor ainda não é exercido.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", content = "c")]
 // Welcome é grande (snapshot completo) e as demais variantes pequenas; boxear
@@ -98,11 +100,9 @@ pub enum ServerMsg {
     /// Config de áudio mudou (F2+).
     #[allow(dead_code)]
     AudioCfg(AudioConfig),
-    /// Lista de contatos mudou (F2+).
-    #[allow(dead_code)]
+    /// Lista de contatos (emitida no connect, L1; e quando mudar na F2+).
     Contacts(Vec<Contact>),
-    /// Histórico mudou (F2+).
-    #[allow(dead_code)]
+    /// Histórico de chamadas (emitido no connect, L1; e quando mudar na F2+).
     History(Vec<CallHistoryEntry>),
     /// Conta/credenciais mudaram (F2+).
     #[allow(dead_code)]
@@ -204,8 +204,12 @@ impl CallPhaseWire {
                 remote_number,
                 remote_name,
                 codec_name,
+                // checked_sub: um elapsed_ms absurdo (cliente/daemon com relógio
+                // ou dado corrompido) faria `Instant::now() - Duration` entrar em
+                // panic por underflow; o fallback ancora no agora (duração 0).
                 connected_at: Instant::now()
-                    - std::time::Duration::from_millis(elapsed_ms),
+                    .checked_sub(std::time::Duration::from_millis(elapsed_ms))
+                    .unwrap_or_else(Instant::now),
             },
         }
     }
@@ -446,6 +450,24 @@ mod tests {
         let mut buf = Vec::new();
         let res = write_frame(&mut buf, &msg);
         assert!(res.is_err(), "payload acima do teto deveria falhar no write");
+    }
+
+    /// N1: um `elapsed_ms` absurdo (u64::MAX) NÃO pode entrar em panic na
+    /// reconstrução. O antigo `Instant::now() - Duration` panicava por underflow;
+    /// o `checked_sub(..).unwrap_or_else(now)` apenas não panica. O valor exato
+    /// do `connected_at` é dependente de plataforma (depende de a subtração
+    /// underflowar ou não no relógio monotônico), então só exigimos que a
+    /// reconstrução retorne um `InCall` sem panicar.
+    #[test]
+    fn test_callphase_incall_absurd_elapsed_no_panic() {
+        let wire = CallPhaseWire::InCall {
+            remote_number: "300".into(),
+            remote_name: "Bob".into(),
+            codec_name: "PCMU".into(),
+            elapsed_ms: u64::MAX,
+        };
+        let phase = wire.into_call_phase(); // não pode panicar
+        assert!(matches!(phase, CallPhase::InCall { .. }));
     }
 
     /// InCall -> elapsed_ms -> Instant reconstruído, com tolerância de ±50ms.

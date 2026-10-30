@@ -136,7 +136,17 @@ fn runtime_dir() -> Result<PathBuf> {
                 .create(&base)
                 .with_context(|| format!("criar runtime dir {}", base.display()))?;
         } else {
-            let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+            // N3: não engole a falha de chmod — um runtime dir que ficou com
+            // permissão frouxa é relevante (o socket IPC é defendido por uid +
+            // chmod 0600, mas o dir 0700 é defesa em profundidade).
+            if let Err(e) =
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            {
+                eprintln!(
+                    "[daemon] aviso: chmod 0700 em {} falhou: {e}",
+                    base.display()
+                );
+            }
         }
     }
     #[cfg(not(unix))]
@@ -518,10 +528,11 @@ async fn graceful_shutdown(
 // Servidor IPC (F1) — expõe o estado do daemon por socket Unix, READ-ONLY.
 // =============================================================================
 
-/// Capacidade do canal por-cliente (backpressure). Mensagens de baixa-frequência
-/// (Reg/Call/Flags/PublicAddr/LogAppend/Welcome) usam `send().await` que só
-/// bloqueia o Publisher brevemente; se o buffer encher, o cliente é lento demais
-/// e é desconectado. A telemetria `Hot` usa `try_send` e é DESCARTADA se cheio.
+/// Capacidade do canal por-cliente (backpressure). As mensagens de baixa-
+/// frequência (Reg/Call/Flags/PublicAddr/LogAppend) usam `try_send`: se o buffer
+/// encher, o cliente é lento demais e é DESCONECTADO (não há espera que pudesse
+/// travar a task de escrita). A telemetria `Hot` também usa `try_send`, mas é
+/// apenas DESCARTADA se cheio (a próxima amostra basta).
 const CLIENT_CHAN_CAP: usize = 256;
 
 /// Máximo de entradas de log reenviadas como backlog logo após o Welcome.
@@ -529,6 +540,11 @@ const LOG_BACKLOG_MAX: usize = 250;
 
 /// Período do tick do Publisher (diff de estado).
 const PUBLISH_TICK: Duration = Duration::from_millis(50);
+
+/// Teto de tempo para o handshake inicial (ler o Hello e escrever o Welcome).
+/// Uma conexão que abre o socket mas não fala (ou não lê) não pode prender a
+/// task de conexão para sempre — passado o teto, a task encerra.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Intervalo mínimo entre `Hot` por cliente (<= 20/s => 50ms). Como o tick já é
 /// 50ms, cada tick pode emitir no máximo um Hot — mas mantemos a checagem
@@ -605,8 +621,21 @@ impl IpcServer {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
 
-        // 1) Lê o Hello (com teto de linha), senão desconecta.
-        let hello = read_client_frame(&mut reader).await?;
+        // 1) Lê o Hello (com teto de linha e de TEMPO), senão desconecta. Sem
+        //    o timeout, uma conexão que abre o socket e cala prenderia esta task
+        //    indefinidamente.
+        let hello = match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            read_client_frame(&mut reader),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                println!("[{}] [daemon] IPC: timeout aguardando Hello; desconectando", ts());
+                return Ok(());
+            }
+        };
         let (client_mtime,) = match hello {
             Some(ClientMsg::Hello { proto, exe_mtime }) => {
                 if proto != PROTO_VERSION {
@@ -631,8 +660,28 @@ impl IpcServer {
             .unwrap_or(false);
 
         let (log_seq_at_snapshot, backlog) = self.log_snapshot();
-        let welcome = self.build_welcome(stale_exe, log_seq_at_snapshot);
-        ipc::write_frame_async(&mut write_half, &welcome).await?;
+        let (welcome, contacts, history) = self.build_welcome(stale_exe, log_seq_at_snapshot);
+        // Timeout no write do Welcome: um cliente que conecta e não lê não pode
+        // prender a task de escrita aqui.
+        match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            ipc::write_frame_async(&mut write_half, &welcome),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                println!("[{}] [daemon] IPC: timeout escrevendo Welcome; desconectando", ts());
+                return Ok(());
+            }
+        }
+
+        // L1: contacts e history NÃO vão no Welcome (estourariam o teto de 256
+        // KiB com muitos itens). Emite cada lista em seu próprio frame logo após
+        // o Welcome — variantes já existentes do protocolo. (A ligação disso no
+        // cliente é da F2; remote.rs é andaime nesta fase.)
+        ipc::write_frame_async(&mut write_half, &ServerMsg::Contacts(contacts)).await?;
+        ipc::write_frame_async(&mut write_half, &ServerMsg::History(history)).await?;
 
         // 3) Backlog de logs (até LOG_BACKLOG_MAX) como LogAppend. O seq de cada
         //    entrada é aproximado: o snapshot nos dá o seq FINAL; reconstruímos
@@ -687,20 +736,30 @@ impl IpcServer {
         res
     }
 
-    /// Lê o seq atual e um backlog das últimas entradas de log (clonadas).
+    /// Lê o seq atual e um backlog das últimas entradas de log (clonadas),
+    /// SOB O MESMO LOCK (`log_seq_and_entries`) para que seq e conteúdo sejam
+    /// coerentes. Depois recorta às últimas `LOG_BACKLOG_MAX`.
     fn log_snapshot(&self) -> (u64, Vec<crate::sip::SipLogEntry>) {
-        let seq = self.sip_state.log_seq.load(Ordering::Relaxed);
-        let backlog = if let Ok(logs) = self.sip_state.logs.lock() {
-            let take = logs.len().min(LOG_BACKLOG_MAX);
-            logs.iter().skip(logs.len() - take).cloned().collect()
-        } else {
-            Vec::new()
-        };
+        let (seq, mut backlog) = self.sip_state.log_seq_and_entries();
+        if backlog.len() > LOG_BACKLOG_MAX {
+            backlog.drain(..backlog.len() - LOG_BACKLOG_MAX);
+        }
         (seq, backlog)
     }
 
     /// Monta o Welcome lendo config + estado atuais.
-    fn build_welcome(&self, stale_exe: bool, log_seq: u64) -> ServerMsg {
+    ///
+    /// L1: `contacts` e `history` NÃO vão dentro do Welcome — com muitos
+    /// contatos/histórico o frame estouraria o teto de 256 KiB e o cliente nunca
+    /// receberia o snapshot. O Welcome sai com as duas listas VAZIAS; as listas
+    /// reais são devolvidas aqui para o chamador emitir como frames `Contacts` e
+    /// `History` separados (variantes já existentes do protocolo), cada um
+    /// pequeno. Retorna `(welcome, contacts, history)`.
+    fn build_welcome(
+        &self,
+        stale_exe: bool,
+        log_seq: u64,
+    ) -> (ServerMsg, Vec<crate::config::Contact>, Vec<crate::config::CallHistoryEntry>) {
         let (account, audio_cfg, contacts, history, pw_reentry) = {
             let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -731,22 +790,24 @@ impl IpcServer {
             .unwrap_or(None);
         let flags = read_flags(&self.audio_state);
 
-        ServerMsg::Welcome {
+        let welcome = ServerMsg::Welcome {
             proto: PROTO_VERSION,
             daemon_pid: self.daemon_pid,
             stale_exe,
             tray_available: self.tray_available,
             account,
             audio: audio_cfg,
-            contacts,
-            history,
+            // L1: listas potencialmente grandes saem em frames próprios.
+            contacts: Vec::new(),
+            history: Vec::new(),
             password_needs_reentry: pw_reentry,
             reg,
             call,
             public_addr,
             flags,
             log_seq,
-        }
+        };
+        (welcome, contacts, history)
     }
 }
 
@@ -805,7 +866,7 @@ impl Publisher {
             if let Some(reg) = reg_now {
                 if reg != last_reg {
                     last_reg = reg.clone();
-                    if self.send_lowfreq(ServerMsg::Reg(reg)).await.is_err() {
+                    if self.send_lowfreq_now(ServerMsg::Reg(reg)).is_err() {
                         return;
                     }
                 }
@@ -823,7 +884,7 @@ impl Publisher {
                 // emite quando a FASE/identidade muda, não a cada tick em chamada.
                 if !same_call_identity(&call, &last_call) {
                     last_call = call.clone();
-                    if self.send_lowfreq(ServerMsg::Call(call)).await.is_err() {
+                    if self.send_lowfreq_now(ServerMsg::Call(call)).is_err() {
                         return;
                     }
                 }
@@ -833,7 +894,7 @@ impl Publisher {
             let flags = read_flags(&self.audio_state);
             if flags != last_flags {
                 last_flags = flags;
-                if self.send_lowfreq(ServerMsg::Flags(flags)).await.is_err() {
+                if self.send_lowfreq_now(ServerMsg::Flags(flags)).is_err() {
                     return;
                 }
             }
@@ -848,32 +909,32 @@ impl Publisher {
             if let Some(pa) = pa_now {
                 if pa != last_public {
                     last_public = pa.clone();
-                    if self.send_lowfreq(ServerMsg::PublicAddr(pa)).await.is_err() {
+                    if self.send_lowfreq_now(ServerMsg::PublicAddr(pa)).is_err() {
                         return;
                     }
                 }
             }
 
             // --- LogAppend (novos desde last_log_seq) ---
-            let cur_seq = self.sip_state.log_seq.load(Ordering::Relaxed);
+            // Lê seq E conteúdo sob o MESMO lock (coerência com add_log). Só
+            // então decide se há algo novo e recorta a cauda. Travar o lock a
+            // cada tick (50ms) é barato; a correção vale mais que o antigo
+            // short-circuit sem lock (que lia o seq fora do lock e abria a
+            // corrida M1).
+            let (cur_seq, all_entries) = self.sip_state.log_seq_and_entries();
             if cur_seq > self.last_log_seq {
                 let new_count = (cur_seq - self.last_log_seq) as usize;
-                // Clona as entradas e SOLTA o guard antes do loop de await.
-                let entries: Vec<crate::sip::SipLogEntry> = {
-                    if let Ok(logs) = self.sip_state.logs.lock() {
-                        let take = new_count.min(logs.len());
-                        logs.iter().skip(logs.len() - take).cloned().collect()
-                    } else {
-                        Vec::new()
-                    }
-                };
+                // Recorta às últimas `new_count` entradas (o ring pode ter
+                // descartado entradas antigas; nunca mais do que há).
+                let take = new_count.min(all_entries.len());
+                let entries = &all_entries[all_entries.len() - take..];
                 let base = cur_seq.saturating_sub(entries.len() as u64) + 1;
-                for (i, entry) in entries.into_iter().enumerate() {
+                for (i, entry) in entries.iter().enumerate() {
                     let msg = ServerMsg::LogAppend {
                         seq: base + i as u64,
-                        entry: SipLogEntryWire::from(&entry),
+                        entry: SipLogEntryWire::from(entry),
                     };
-                    if self.send_lowfreq(msg).await.is_err() {
+                    if self.send_lowfreq_now(msg).is_err() {
                         return;
                     }
                 }
@@ -917,11 +978,19 @@ impl Publisher {
         }
     }
 
-    /// Envia uma mensagem de baixa-frequência; o `send().await` aplica
-    /// backpressure e, se o canal fechou (cliente foi), retorna Err para o run
-    /// encerrar.
-    async fn send_lowfreq(&self, msg: ServerMsg) -> Result<(), ()> {
-        self.tx.send(msg).await.map_err(|_| ())
+    /// Envia uma mensagem de baixa-frequência SEM bloquear o Publisher.
+    ///
+    /// Usa `try_send`: se o canal encheu (`Full`), o cliente está lento demais
+    /// e é DESCONECTADO (retorna `Err`) — como o comentário de `CLIENT_CHAN_CAP`
+    /// promete. O antigo `send().await` apenas ESPERAVA, e um cliente que parou
+    /// de ler travava a task de escrita para sempre (o braço de leitura do
+    /// `select!` nunca mais rodava). `Closed` (cliente já foi) também vira `Err`.
+    fn send_lowfreq_now(&self, msg: ServerMsg) -> Result<(), ()> {
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
     }
 }
 
