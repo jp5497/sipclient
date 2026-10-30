@@ -238,13 +238,28 @@ impl AudioSharedState {
 #[derive(Clone)]
 pub struct AudioEngine {
     pub state: Arc<AudioSharedState>,
+    /// A1 (ADR-0001): quando `true` (janela cliente do daemon), NENHUM stream
+    /// PipeWire é aberto — `spawn_streams`/`play_keypad_dtmf`/`start_*_test`
+    /// retornam cedo. O áudio real roda SÓ no daemon; a janela é um espelho.
+    /// `new()` cria um engine REAL (`inert=false`, usado pelo daemon);
+    /// `from_state()` cria o espelho inerte (`inert=true`, usado pela janela).
+    inert: bool,
 }
 
 impl AudioEngine {
     pub fn new() -> Self {
         Self {
             state: AudioSharedState::new(),
+            inert: false,
         }
+    }
+
+    /// Envolve um `AudioSharedState` EXISTENTE sem abrir dispositivo algum. Usado
+    /// no modo `--remote` (F1): a janela lê os níveis de VU/flags deste espelho,
+    /// que a thread de IPC preenche a partir das `ServerMsg::Hot`/`Flags`. O
+    /// daemon é o dono do áudio real — aqui nenhum PipeWire/pactl é tocado.
+    pub fn from_state(state: Arc<AudioSharedState>) -> Self {
+        Self { state, inert: true }
     }
 
     /// Lista todos os microfones reais do PipeWire / PulseAudio (ignorando monitores de saída)
@@ -402,6 +417,12 @@ impl AudioEngine {
         input_device: Option<String>,
         output_device: Option<String>,
     ) {
+        // A1: a janela cliente não roda loopback (abriria PipeWire). O daemon
+        // faz o teste real via ClientMsg::StartLoopbackTest e emite o mode nas
+        // Flags; aqui nem mexe no mode do espelho.
+        if self.inert {
+            return;
+        }
         self.state.clear_buffers();
         self.state.mode.store(MODE_LOOPBACK_TEST, Ordering::Relaxed);
         self.spawn_streams(input_device, output_device, true, false);
@@ -430,6 +451,12 @@ impl AudioEngine {
     }
 
     pub fn play_keypad_dtmf(&self, digit: char, output_device: Option<String>) {
+        // A1: a janela cliente não gera tom local nem abre PipeWire — o daemon
+        // é quem toca o DTMF (via ClientMsg::KeypadDigit). Retorna antes até de
+        // enfileirar o tom, para o espelho não acumular áudio que ninguém toca.
+        if self.inert {
+            return;
+        }
         self.state.queue_dtmf_tone(digit);
         if self.state.mode.load(Ordering::Relaxed) == MODE_IDLE {
             self.spawn_streams(None, output_device, false, true);
@@ -443,6 +470,13 @@ impl AudioEngine {
         need_input: bool,
         ephemeral_tone_only: bool,
     ) {
+        // A1: a janela cliente NUNCA abre PipeWire. Este é o único ponto que
+        // sobe as threads de captura/reprodução — guardar aqui fecha TODOS os
+        // caminhos (start_call_audio/ringing/ringback/loopback/dtmf/reload) de
+        // forma estrutural. O áudio real roda só no daemon (inert=false).
+        if self.inert {
+            return;
+        }
         let gen = self.state.session_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
         // 1. Thread de Saída (Playback @ 8000 Hz S16LE Mono via PipeWire/PulseAudio)
@@ -752,5 +786,33 @@ mod tests {
         }
         assert!(!inputs.is_empty(), "Deve detectar ao menos 1 microfone no PipeWire");
         assert!(!outputs.is_empty(), "Deve detectar ao menos 1 saída no PipeWire");
+    }
+
+    /// A1: um AudioEngine inerte (from_state, usado pela janela cliente) NUNCA
+    /// abre stream nem mexe no mode — start_loopback_test/play_keypad_dtmf são
+    /// no-op. Sem este guard a janela abriria PipeWire (o achado A1 do gate).
+    /// Não depende de hardware: só observa que o mode permanece IDLE.
+    #[test]
+    fn test_inert_engine_opens_no_streams() {
+        let state = AudioSharedState::new();
+        let engine = AudioEngine::from_state(state.clone());
+        assert_eq!(state.mode.load(Ordering::Relaxed), MODE_IDLE);
+
+        engine.start_loopback_test(None, None);
+        assert_eq!(
+            state.mode.load(Ordering::Relaxed),
+            MODE_IDLE,
+            "engine inerte não deve entrar em loopback (abriria PipeWire)"
+        );
+
+        engine.play_keypad_dtmf('5', None);
+        assert_eq!(
+            state.mode.load(Ordering::Relaxed),
+            MODE_IDLE,
+            "engine inerte não deve sair de IDLE ao tocar DTMF"
+        );
+        // Também não enfileira tom algum no espelho.
+        let queued = state.tone_pcm_8k.lock().map(|q| q.len()).unwrap_or(0);
+        assert_eq!(queued, 0, "engine inerte não deve enfileirar tom DTMF");
     }
 }

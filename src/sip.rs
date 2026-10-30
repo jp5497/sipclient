@@ -7,13 +7,14 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RegistrationStatus {
     Disconnected,
     Connecting,
@@ -60,6 +61,10 @@ pub struct SipSharedState {
     pub reg_status: Mutex<RegistrationStatus>,
     pub call_phase: Mutex<CallPhase>,
     pub logs: Mutex<VecDeque<SipLogEntry>>,
+    /// Contador monotônico incrementado a cada `add_log`. Permite a um
+    /// observador (ex. o daemon na F1) detectar que há log novo sem travar o
+    /// Mutex de `logs` nem comparar conteúdo — basta comparar o seq lido antes.
+    pub log_seq: AtomicU64,
     pub completed_calls: Mutex<VecDeque<CompletedCallRecord>>,
     pub rtp_stats: Arc<RtpStats>,
     pub detected_public_addr: Mutex<Option<String>>,
@@ -71,6 +76,7 @@ impl SipSharedState {
             reg_status: Mutex::new(RegistrationStatus::Disconnected),
             call_phase: Mutex::new(CallPhase::Idle),
             logs: Mutex::new(VecDeque::with_capacity(200)),
+            log_seq: AtomicU64::new(0),
             completed_calls: Mutex::new(VecDeque::new()),
             rtp_stats,
             detected_public_addr: Mutex::new(None),
@@ -89,6 +95,27 @@ impl SipSharedState {
                 logs.pop_front();
             }
             logs.push_back(entry);
+            // Incrementa o seq DENTRO do lock de `logs`: o seq passa a ser
+            // coerente com o conteúdo para qualquer leitor que também leia o
+            // seq sob o mesmo lock (ver `log_seq_and_entries`). Sem isso, o
+            // fetch_add fora do lock abria corrida — um observador podia ler um
+            // seq novo e travar `logs` só depois, perdendo/duplicando entradas
+            // numa rajada de TX/RX. Relaxed basta: a exclusão mútua vem do lock
+            // de `logs`, não da ordem atômica.
+            self.log_seq.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Lê o seq de log E um clone das entradas SOB O MESMO LOCK de `logs`, para
+    /// que seq e conteúdo sejam um par coerente (sem corrida com `add_log`, que
+    /// incrementa o seq dentro deste mesmo lock). Os leitores do daemon (snapshot
+    /// inicial e Publisher) usam este par e fatiam o `Vec` conforme a necessidade.
+    pub fn log_seq_and_entries(&self) -> (u64, Vec<SipLogEntry>) {
+        if let Ok(logs) = self.logs.lock() {
+            let seq = self.log_seq.load(Ordering::Relaxed);
+            (seq, logs.iter().cloned().collect())
+        } else {
+            (self.log_seq.load(Ordering::Relaxed), Vec::new())
         }
     }
 
@@ -155,6 +182,18 @@ impl SipController {
 
     pub fn send(&self, cmd: SipCommand) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Controlador INERTE para o modo `--remote` (F1, read-only via IPC): NÃO
+    /// sobe a thread do supervisor SIP, logo não abre socket nem faz REGISTER —
+    /// o daemon é o dono do núcleo. O `state` retornado é o ESPELHO que a thread
+    /// de IPC preenche a partir das `ServerMsg`. `send()` vira no-op (o receptor
+    /// do canal é descartado), pois comandos só chegam na F2.
+    pub fn new_inert(state: Arc<SipSharedState>) -> Self {
+        // O receptor é descartado imediatamente: send() não entrega a ninguém
+        // (retorna Err, ignorado) e nenhuma task roda.
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        Self { state, cmd_tx }
     }
 }
 
@@ -2433,6 +2472,42 @@ fn send_dialog_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M1: o seq de log é coerente com o conteúdo quando lido via
+    /// `log_seq_and_entries` (ambos sob o mesmo lock). Após N `add_log`, o seq é
+    /// N e o último entry lido corresponde ao último anexado — sem a corrida do
+    /// fetch_add fora do lock.
+    #[test]
+    fn test_log_seq_coherent_with_entries() {
+        let st = SipSharedState::new(RtpStats::new());
+        for i in 0..5u32 {
+            st.add_log("TX", format!("REGISTER #{i}"), "raw");
+        }
+        let (seq, entries) = st.log_seq_and_entries();
+        assert_eq!(seq, 5, "seq deve contar cada add_log");
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.last().unwrap().summary, "REGISTER #4");
+
+        // Concorrência: várias threads anexando em rajada; ao final seq == total
+        // e o número de entradas retidas nunca excede o seq.
+        let st2 = SipSharedState::new(RtpStats::new());
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let st2 = st2.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    st2.add_log("RX", format!("t{t}-{i}"), "raw");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (seq2, entries2) = st2.log_seq_and_entries();
+        assert_eq!(seq2, 200, "seq deve igualar o total de add_log concorrentes");
+        // O ring retém no máx 250; aqui 200 < 250, então todas foram retidas.
+        assert_eq!(entries2.len(), 200);
+    }
 
     #[test]
     fn test_freeswitch_digest_challenge_and_auth() {

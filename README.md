@@ -87,6 +87,49 @@ Ao abrir o RustSIP, acesse a aba **Conta**:
 
 ---
 
+## 🖥️ Daemon + System Tray
+
+A partir da refatoração daemon+IPC, o RustSIP roda em **dois papéis** sobre o
+mesmo binário, para manter o registro SIP e a chamada vivos mesmo com a janela
+fechada:
+
+- **`rustsip`** (padrão): garante que o **daemon** esteja no ar e abre a
+  **janela**. Se o daemon já estiver rodando, apenas conecta a ele.
+- **`rustsip daemon`**: sobe só o **daemon headless** (núcleo SIP + áudio +
+  ícone de bandeja), sem janela.
+
+O daemon é o único dono do núcleo: ele registra no PBX, trata as chamadas e é o
+único processo que escreve em `~/.config/rustsip/config.json`. A janela é um
+**cliente** que fala com o daemon por um socket Unix local.
+
+### Fechar a janela × Sair
+
+- **Fechar a janela** (com bandeja disponível): a **janela encerra**, mas o
+  **daemon continua em segundo plano** — o registro SIP e uma chamada em curso
+  seguem vivos. Reabra pelo ícone da bandeja em **"Mostrar"**.
+- **"Sair"** (no menu da bandeja): encerra o **daemon** de forma graciosa
+  (desliga a chamada, faz un-REGISTER e para o áudio). É a única ação que
+  realmente finaliza o app.
+- **Fallback sem host SNI** (sem bandeja no ambiente): como não haveria ícone
+  para reabrir, **fechar a janela também encerra o daemon** — o app não fica
+  inacessível em background.
+
+### Requisitos da bandeja
+
+O ícone usa o padrão **StatusNotifierItem (SNI)** via D-Bus, suportado
+nativamente no **KDE Plasma** e em outros ambientes Linux/BSD com host SNI.
+O **GNOME puro** não expõe host SNI por padrão — é necessária a extensão
+**AppIndicator and KStatusNotifierItem Support** para o ícone aparecer. Sem um
+host SNI, o app cai no fallback descrito acima (fechar encerra o daemon).
+
+### Arquivos em runtime
+
+- **Log do daemon:** `~/.config/rustsip/daemon.log`
+- **Socket IPC:** `$XDG_RUNTIME_DIR/rustsip/` (socket Unix local, só o dono
+  conecta — permissão 0600).
+
+---
+
 ## 📄 Licença
 
 Distribuído sob a licença MIT. Consulte o arquivo [LICENSE](LICENSE) para obter mais informações.

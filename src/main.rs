@@ -2,27 +2,39 @@ mod audio;
 mod codec;
 mod config;
 mod crypto;
+mod daemon;
+mod ipc;
+mod remote;
 mod rtp;
 mod sip;
 mod theme;
 mod ui;
 
-use eframe::egui;
-use ui::RustSipApp;
-
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RustSIP — Softphone Nativo Linux")
-            .with_app_id("rustsip")
-            .with_inner_size([380.0, 640.0])
-            .with_min_inner_size([360.0, 560.0]),
-        ..Default::default()
-    };
+    // Dispatch por argumento (sem clap):
+    //   `rustsip daemon`           -> modo daemon headless com bandeja (F0);
+    //   `rustsip` (sem args)       -> F2: garante o daemon vivo e abre a JANELA
+    //                                 CLIENTE que fala com ele por IPC. A janela
+    //                                 não roda mais SIP/áudio in-process (fecha o
+    //                                 achado A1);
+    //   `rustsip --remote`/`remote`-> alias explícito do MESMO caminho da janela
+    //                                 cliente (o default o absorveu; mantido por
+    //                                 conveniência/scripts).
+    //
+    // args_os (não args): std::env::args() faz PANIC se algum argumento não for
+    // UTF-8. O dispatch só compara o 1º arg com literais ASCII, então comparar
+    // o OsStr cru evita o panic de borda sem mudar o comportamento.
+    let arg1 = std::env::args_os().nth(1);
+    if arg1.as_deref() == Some(std::ffi::OsStr::new("daemon")) {
+        if let Err(e) = daemon::run() {
+            eprintln!("rustsip daemon: erro fatal: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
-    eframe::run_native(
-        "RustSIP",
-        options,
-        Box::new(|cc| Ok(Box::new(RustSipApp::new(cc)))),
-    )
+    // Default E alias --remote/remote: a janela cliente do daemon. O
+    // RustSipApp::new in-process foi REMOVIDO (código morto) — a UI é sempre
+    // cliente IPC agora.
+    remote::run_remote_window()
 }
